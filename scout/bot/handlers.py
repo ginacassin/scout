@@ -11,7 +11,7 @@ from pathlib import Path
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -84,7 +84,10 @@ class TelegramNotifier:
         if self.paused:
             return  # sent on /resume
         header = "👀 Teaser: something's coming" if not event.date_list else "🆕 New market"
-        await self.send_event_card(event, header=header)
+        try:
+            await self.send_event_card(event, header=header)
+        except TelegramError:
+            log.exception("Could not send event %s; it will be sent on /start or /resume", event.id)
 
     async def event_update(self, event: Event, changes: list[str]) -> None:
         if self.paused:
@@ -105,10 +108,27 @@ class TelegramNotifier:
         try:
             await self.app.bot.send_message(self.chat_id, text, parse_mode=ParseMode.HTML, **kwargs)
         except BadRequest:
-            await self.app.bot.send_message(self.chat_id, text, parse_mode=ParseMode.HTML)
+            try:
+                await self.app.bot.send_message(self.chat_id, text, parse_mode=ParseMode.HTML)
+            except TelegramError:
+                log.exception("Could not send update for event %s", event.id)
+        except TelegramError:
+            log.exception("Could not send update for event %s", event.id)
 
     async def warn(self, text: str) -> None:
-        await self.app.bot.send_message(self.chat_id, escape(text), parse_mode=ParseMode.HTML)
+        try:
+            await self.app.bot.send_message(self.chat_id, escape(text), parse_mode=ParseMode.HTML)
+        except TelegramError:
+            log.exception("Could not send warning: %s", text)
+
+    async def send_unsent(self, header: str) -> int:
+        """Cards found while alerts were paused or before the chat was opened."""
+        with self.db.session() as s:
+            pending = list(s.scalars(select(Event).where(
+                Event.user_decision == "pending", Event.telegram_message_id.is_(None), Event.status != "past")))
+        for ev in sorted(pending, key=lambda e: e.created_at):
+            await self.send_event_card(ev, header=header)
+        return len(pending)
 
 
 class BotHandlers:
@@ -122,7 +142,7 @@ class BotHandlers:
     def register(self, app: Application) -> None:
         only_me = filters.Chat(chat_id=self.settings.allowed_chat_id)
         cmds = {
-            "start": self.cmd_help, "help": self.cmd_help, "add": self.cmd_add, "remove": self.cmd_remove,
+            "start": self.cmd_start, "help": self.cmd_help, "add": self.cmd_add, "remove": self.cmd_remove,
             "list": self.cmd_list, "upcoming": self.cmd_upcoming, "maybe": self.cmd_maybe, "check": self.cmd_check,
             "pause": self.cmd_pause, "resume": self.cmd_resume, "status": self.cmd_status,
         }
@@ -137,6 +157,12 @@ class BotHandlers:
     # ----------------------------------------------------------------- commands
     async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_html(T.HELP)
+
+    async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        n = len(self.db.active_accounts())
+        await update.effective_message.reply_html(f"👋 Hi! I'm following {n} accounts for you.\n\n" + T.HELP)
+        if not self.notifier.paused:
+            await self.notifier.send_unsent("🆕 Found while you were away")
 
     async def cmd_add(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not ctx.args:
@@ -246,12 +272,8 @@ class BotHandlers:
 
     async def cmd_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         self.db.set_setting("paused", "0")
-        with self.db.session() as s:
-            pending = list(s.scalars(select(Event).where(
-                Event.user_decision == "pending", Event.telegram_message_id.is_(None), Event.status != "past")))
-        await update.effective_message.reply_text(f"▶️ Alerts back on. {len(pending)} waiting.")
-        for ev in pending:
-            await self.notifier.send_event_card(ev, header="🆕 While you were paused")
+        await update.effective_message.reply_text("▶️ Alerts back on.")
+        await self.notifier.send_unsent("🆕 While you were paused")
 
     async def cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         tz = self.settings.tz

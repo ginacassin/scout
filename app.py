@@ -7,6 +7,7 @@ import hashlib
 import logging
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import Application
 
 from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
@@ -56,7 +57,11 @@ def main() -> None:
             ("help", "What Scout does"),
         ])
         n = len(db.active_accounts())
-        await application.bot.send_message(settings.allowed_chat_id, f"🟢 Scout is up — following {n} accounts.")
+        try:
+            await application.bot.send_message(settings.allowed_chat_id, f"🟢 Scout is up — following {n} accounts.")
+        except TelegramError as exc:
+            # Telegram refuses until the user has pressed Start in the bot's chat.
+            log.warning("Can't message chat %s yet (%s). Open the bot and press Start.", settings.allowed_chat_id, exc)
 
     app.post_init = on_start
 
