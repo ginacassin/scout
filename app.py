@@ -17,6 +17,7 @@ from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
 from scout.config import Settings
 from scout.db import Database
 from scout.gcal import setup_calendar
+from scout.bot.booking_cmds import register_booking_cmds
 from scout.uptime import setup_uptime
 from scout.eventbrite import setup_booking_watcher
 from scout.parser.gemini import GeminiParser
@@ -52,6 +53,7 @@ def main() -> None:
     setup_booking_watcher(app, settings, db)  # M3: Eventbrite booking pings, /bookings
     schedule_jobs(app, scout, settings, db)
     setup_calendar(app, settings, db)  # M2: no-op unless GCAL_SA_JSON and GCAL_CALENDAR_ID are set
+    register_booking_cmds(app, settings, db, notifier)  # /booked, /note, tickets, market-day reminders
     app.add_error_handler(obs.ErrorReporter(settings.allowed_chat_id))
     setup_autobook(app, settings, db)
     setup_uptime(app, settings, db)  # tells you only when Scout was down or checks keep failing

@@ -600,6 +600,7 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
             log.info("Upkeep: %d duplicate events merged", merged)
             removed = prune_media(settings.media_dir)
             log.info("Upkeep: %d events marked past, %d images pruned", n, removed)
+            from ..cleanup import run_cleanup; run_cleanup(db, settings)  # noqa: E702 — retention (RETENTION_DAYS)
 
     async def dedupe_once(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         n = await scout.dedupe_events()

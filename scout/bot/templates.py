@@ -94,18 +94,44 @@ def event_caption(ev: Event, handle: str, tz: ZoneInfo, header: str | None = Non
     elif ev.booking_method == "free_entry":
         lines.append(f"🎟 Free entry{' · ' + escape(ev.price) if ev.price and ev.price.lower() != 'free' else ''}")
 
-    if ev.summary:
-        lines.append("")
-        lines.append(escape(ev.summary))
+    booked = booked_line(ev, tz)
+    if booked:
+        lines.append(booked)
 
+    notes = notes_lines(ev)
+    if notes:
+        lines.append("")
+        lines += notes
+
+    footer: list[str] = []
     if ev.user_decision in DECISION_FOOTER:
-        lines.append("")
-        lines.append(DECISION_FOOTER[ev.user_decision])
+        footer = ["", DECISION_FOOTER[ev.user_decision]]
 
-    text = "\n".join(lines)
+    summary: list[str] = ["", escape(ev.summary)] if ev.summary else []
+    text = "\n".join(lines + summary + footer)
+    if len(text) > CAPTION_LIMIT and summary:
+        # Shorten the summary first so notes and the decision footer survive.
+        room = CAPTION_LIMIT - len("\n".join(lines + footer)) - 3
+        summary = ["", escape(ev.summary[: max(0, room - 20)]).rstrip() + "…"] if room > 40 else []
+        text = "\n".join(lines + summary + footer)
     if len(text) > CAPTION_LIMIT:
         text = text[: CAPTION_LIMIT - 1] + "…"
     return text
+
+
+def booked_line(ev: Event, tz: ZoneInfo) -> str | None:
+    if ev.booked_start is None:
+        return None
+    who = "auto" if ev.booked_via == "auto" else "by you"
+    ticket = " · ticket saved" if ev.ticket_path else ""
+    return f"🎟 <b>Booked {fmt_dt(ev.booked_start, tz)}</b> ({who}){ticket}"
+
+
+def notes_lines(ev: Event) -> list[str]:
+    notes = [n.get("text", "") for n in ev.note_list if n.get("text")]
+    if not notes:
+        return []
+    return ["📝 <b>Notes:</b>"] + [f"• {escape(n)}" for n in notes]
 
 
 # Feature modules (eventbrite watcher, auto-booker) append functions here that return extra
@@ -167,6 +193,8 @@ HELP = (
     "/check — check all accounts now\n"
     "/pause · /resume — mute or unmute alerts\n"
     "/status — last checks and Apify credit\n"
-    "/logs — recent warnings and errors (<code>/logs all</code> for everything)\n\n"
+    "/logs — recent warnings and errors (<code>/logs all</code> for everything)\n"
+    "/booked <i>id HH:MM [date]</i> — tell me you booked a slot · /unbook <i>id</i>\n"
+    "/note <i>id text</i> — remember something for a market (or reply to its card) · /notes · /delnote\n\n"
     "You can also paste an Instagram profile link."
 )

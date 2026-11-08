@@ -5,8 +5,14 @@ Tokens are minted with google-auth's signer and exchanged over httpx; the Calend
 called directly with httpx (no googleapiclient).
 
 What is stored in Event.gcal_event_id (a JSON string):
-    {"days": {"<key>": "<gcal id>", ...}, "booking": "<gcal id>" | null}
+    {"days": {"<key>": "<gcal id>", ...}, "booking": "<gcal id>" | null,
+     "booked": "<gcal id>" | null, "ticket": {Drive attachment} | null}
 where <key> is "2026-11-13" for a timed day or "2026-11-13..2026-11-15" for an all-day span.
+
+Once a slot is booked (scout.bookings.record_booking) the per-day entries and the "🎟 Book:"
+reminder are deleted and ONE timed "booked" entry remains; clearing the booking restores them.
+A ticket QR is uploaded to a Drive folder shared with the service account (GDRIVE_FOLDER_ID) and
+attached to the booked entry when possible; it is always pinned in the Telegram chat as well.
 Every calendar event also carries extendedProperties.private {scoutId, scoutKey}, so a lost
 column can be rebuilt from Google (events.list ?privateExtendedProperty=scoutId=N) and retries
 never duplicate.
@@ -20,7 +26,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
+import os
 import time as _time
+import uuid
+from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -34,20 +44,36 @@ from scout.db import Account, Database, Event
 log = logging.getLogger(__name__)
 
 SCOPE = "https://www.googleapis.com/auth/calendar.events"
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+DEFAULT_SCOPES = (SCOPE, DRIVE_SCOPE)
 API = "https://www.googleapis.com/calendar/v3"
+DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
 DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token"
 PENDING_KEY = "gcal_pending"
 WARNED_KEY = "gcal_warned"
 RETRY_SECONDS = 600
 BOOKING = "booking"
+BOOKED = "booked"
+QUOTA_WARNED_KEY = "gdrive_quota_warned"
+TICKET_IN_CHAT = "Ticket QR: in your Scout chat (pinned)"
+MY_TICKETS = "https://www.eventbrite.es/mytickets/"
+
+
+def configured_scopes() -> list[str]:
+    """GOOGLE_SCOPES (space or comma separated; short names like "drive" allowed) or the defaults."""
+    raw = os.environ.get("GOOGLE_SCOPES", "").replace(",", " ").split()
+    if not raw:
+        return list(DEFAULT_SCOPES)
+    return [x if x.startswith("https://") else f"https://www.googleapis.com/auth/{x}" for x in raw]
 
 BOOKING_NAME = {"eventbrite": "Eventbrite", "other_link": "booking link", "dm": "DM", "free_entry": "Free entry"}
 
 
 class CalendarError(Exception):
-    def __init__(self, status: int | None, message: str):
+    def __init__(self, status: int | None, message: str, reason: str | None = None):
         super().__init__(f"{status}: {message}" if status else message)
         self.status = status
+        self.reason = reason  # Google's error reason, e.g. "storageQuotaExceeded"
 
     @property
     def access_problem(self) -> bool:
@@ -64,12 +90,13 @@ class TokenProvider(Protocol):
 class ServiceAccountTokens:
     """Mints OAuth access tokens for a service account. The key itself is never logged."""
 
-    def __init__(self, info: dict[str, Any], client: httpx.AsyncClient):
+    def __init__(self, info: dict[str, Any], client: httpx.AsyncClient, scopes: list[str] | None = None):
         from google.auth import jwt
         from google.oauth2 import service_account
 
         self._jwt = jwt
-        self._creds = service_account.Credentials.from_service_account_info(info, scopes=[SCOPE])
+        self.scopes = list(scopes or configured_scopes())
+        self._creds = service_account.Credentials.from_service_account_info(info, scopes=self.scopes)
         self._token_uri = info.get("token_uri") or DEFAULT_TOKEN_URI
         self._client = client
         self._token: str | None = None
@@ -86,7 +113,7 @@ class ServiceAccountTokens:
                 return self._token
             now = int(_time.time())
             assertion = self._jwt.encode(self._creds.signer, {
-                "iss": self.email, "scope": SCOPE, "aud": self._token_uri, "iat": now, "exp": now + 3600,
+                "iss": self.email, "scope": " ".join(self.scopes), "aud": self._token_uri, "iat": now, "exp": now + 3600,
             })
             resp = await self._client.post(self._token_uri, data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion.decode(),
@@ -171,8 +198,66 @@ def describe(ev: Event, handle: str | None, tz) -> str:  # noqa: ANN001
     sched = schedule_text(ev)
     if sched:
         blocks.append("Opening hours:\n" + "\n".join(sched))
+    notes = notes_text(ev)
+    if notes:
+        blocks.append(notes)
     blocks.append("Added by Scout")
     return "\n\n".join(blocks)
+
+
+def notes_text(ev: Event) -> str | None:
+    notes = [n.get("text", "") for n in ev.note_list if n.get("text")]
+    return ("📝 Notes:\n" + "\n".join(f"• {n}" for n in notes)) if notes else None
+
+
+def describe_booked(ev: Event, handle: str | None, tz, eventbrite_url: str | None = None,  # noqa: ANN001
+                    ticket: dict[str, Any] | None = None) -> str:
+    blocks = []
+    ig = ev.source_url or (f"https://www.instagram.com/{handle}/" if handle else None)
+    if ig:
+        blocks.append(f"📸 Instagram{f' @{handle}' if handle else ''}: {ig}")
+    if ev.address:
+        blocks.append(f"📍 {ev.address}")
+    if ev.booking_method == "eventbrite" or eventbrite_url:
+        lines = []
+        if eventbrite_url:
+            lines.append(f"🎟 Eventbrite: {eventbrite_url}")
+        lines.append(f"🎫 Your Eventbrite orders: {MY_TICKETS}")
+        blocks.append("\n".join(lines))
+    elif ev.booking_url:
+        blocks.append(f"🎟 Booking: {ev.booking_url}")
+    if ev.ticket_path:
+        t = [TICKET_IN_CHAT]
+        if ticket and ticket.get("fileUrl"):
+            t.append(f"Ticket file (Google Drive, attached): {ticket['fileUrl']}")
+        blocks.append("\n".join(t))
+    notes = notes_text(ev)
+    if notes:
+        blocks.append(notes)
+    if ev.summary:
+        blocks.append(ev.summary.strip())
+    blocks.append("Booked automatically by Scout" if ev.booked_via == "auto" else "Booked by you")
+    return "\n\n".join(blocks)
+
+
+def booked_event(ev: Event, handle: str | None, tz, eventbrite_url: str | None = None,  # noqa: ANN001
+                 ticket: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The single timed calendar entry that replaces all dates once a slot is booked."""
+    tzname = getattr(tz, "key", str(tz))
+    start = ev.booked_start.astimezone(tz)
+    end = (ev.booked_end or ev.booked_start + timedelta(minutes=30)).astimezone(tz)
+    body: dict[str, Any] = {
+        "summary": f"🎟 {ev.title} — booked {start:%H:%M}",
+        "location": ev.address or ev.area or "",
+        "description": describe_booked(ev, handle, tz, eventbrite_url, ticket),
+        "start": {"dateTime": start.replace(tzinfo=None).isoformat(timespec="seconds"), "timeZone": tzname},
+        "end": {"dateTime": end.replace(tzinfo=None).isoformat(timespec="seconds"), "timeZone": tzname},
+        "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 60}]},
+        "extendedProperties": {"private": {"scoutId": str(ev.id), "scoutKey": BOOKED}},
+    }
+    if ticket and ticket.get("fileUrl"):
+        body["attachments"] = [{k: ticket[k] for k in ("fileUrl", "title", "mimeType", "fileId") if ticket.get(k)}]
+    return body
 
 
 def _hm(value: str | None) -> tuple[int, int] | None:
@@ -246,6 +331,7 @@ def desired_events(ev: Event, handle: str | None, tz, now: datetime) -> dict[str
 
 
 def load_state(raw: str | None) -> dict[str, Any]:
+    """Old states keep their exact shape ({"days", "booking"}); "booked"/"ticket" appear only when used."""
     if not raw:
         return {"days": {}, "booking": None}
     try:
@@ -254,13 +340,21 @@ def load_state(raw: str | None) -> dict[str, Any]:
         return {"days": {"legacy": raw}, "booking": None}  # pre-M2 plain id
     if isinstance(data, list):  # tolerate a bare list of ids
         return {"days": {f"legacy{i}": x for i, x in enumerate(data)}, "booking": None}
-    return {"days": dict(data.get("days") or {}), "booking": data.get("booking")}
+    out = {"days": dict(data.get("days") or {}), "booking": data.get("booking")}
+    for extra in (BOOKED, "ticket"):
+        if data.get(extra):
+            out[extra] = data[extra]
+    return out
 
 
 def dump_state(state: dict[str, Any]) -> str | None:
-    if not state["days"] and not state["booking"]:
+    if not state["days"] and not state["booking"] and not state.get(BOOKED) and not state.get("ticket"):
         return None
-    return json.dumps({"days": state["days"], "booking": state["booking"]})
+    out = {"days": state["days"], "booking": state["booking"]}
+    for extra in (BOOKED, "ticket"):
+        if state.get(extra):
+            out[extra] = state[extra]
+    return json.dumps(out)
 
 
 # --------------------------------------------------------------------------- sync
@@ -289,9 +383,10 @@ class CalendarSync:
     def _events_url(self) -> str:
         return f"{API}/calendars/{quote(self.calendar_id, safe='')}/events"
 
-    async def _call(self, method: str, url: str, **kw) -> dict[str, Any]:  # noqa: ANN003
+    async def _call(self, method: str, url: str, headers_extra: dict[str, str] | None = None,
+                    **kw) -> dict[str, Any]:  # noqa: ANN003
         for attempt in (1, 2):
-            headers = {"Authorization": f"Bearer {await self.tokens.token()}"}
+            headers = {"Authorization": f"Bearer {await self.tokens.token()}", **(headers_extra or {})}
             try:
                 resp = await self.client.request(method, url, headers=headers, **kw)
             except httpx.HTTPError as exc:
@@ -300,11 +395,14 @@ class CalendarSync:
                 self.tokens.invalidate()  # expired or revoked; mint a fresh one and try once more
                 continue
             if resp.status_code >= 400:
+                reason = None
                 try:
-                    msg = resp.json().get("error", {}).get("message", "")
-                except ValueError:
+                    err = resp.json().get("error", {})
+                    msg = err.get("message", "")
+                    reason = next((e.get("reason") for e in err.get("errors") or [] if e.get("reason")), None)
+                except (ValueError, AttributeError):
                     msg = resp.text[:200]
-                raise CalendarError(resp.status_code, msg)
+                raise CalendarError(resp.status_code, msg, reason)
             return resp.json() if resp.content else {}
         raise AssertionError("unreachable")
 
@@ -314,11 +412,16 @@ class CalendarSync:
         })
         return [i for i in data.get("items", []) if i.get("status") != "cancelled"]
 
+    @staticmethod
+    def _params(body: dict[str, Any]) -> dict[str, str] | None:
+        return {"supportsAttachments": "true"} if "attachments" in body else None
+
     async def _insert(self, body: dict[str, Any]) -> dict[str, Any]:
-        return await self._call("POST", self._events_url, json=body)
+        return await self._call("POST", self._events_url, json=body, params=self._params(body))
 
     async def _patch(self, gid: str, body: dict[str, Any]) -> dict[str, Any]:
-        return await self._call("PATCH", f"{self._events_url}/{quote(gid, safe='')}", json=body)
+        return await self._call("PATCH", f"{self._events_url}/{quote(gid, safe='')}", json=body,
+                                params=self._params(body))
 
     async def _delete(self, gid: str) -> None:
         try:
@@ -349,6 +452,16 @@ class CalendarSync:
                 return None, None
             acc = s.get(Account, ev.account_id)
             return ev, acc.handle if acc else None
+
+    def _eventbrite_url(self, event_id: int, ev: Event) -> str | None:
+        from scout.db import BookingWatch
+
+        with self.db.session() as s:
+            w = s.scalar(select(BookingWatch).where(BookingWatch.event_id == event_id))
+            url = w.event_url if w else None
+        if not url and (ev.booking_url or "").startswith("https://") and "eventbrite" in ev.booking_url:
+            url = ev.booking_url
+        return url
 
     def _save_state(self, event_id: int, state: dict[str, Any]) -> None:
         with self.db.session() as s:
@@ -388,12 +501,15 @@ class CalendarSync:
         if self._is_past(ev):
             return  # leave history alone
         state = load_state(ev.gcal_event_id)
-        want = ev.user_decision == "yes" and bool(ev.date_list)
+        booked = ev.booked_start is not None
+        want = ev.user_decision == "yes" and (bool(ev.date_list) or booked)
 
         if not want:
             items = [(k, v) for k, v in state["days"].items()]
             if state["booking"]:
                 items.append((BOOKING, state["booking"]))
+            if state.get(BOOKED):
+                items.append((BOOKED, state[BOOKED]))
             if not items and event_id in self.pending():
                 # An earlier create may have reached Google before failing here: clean up orphans.
                 items = [(i["id"], i["id"]) for i in await self._find(event_id)]
@@ -405,22 +521,30 @@ class CalendarSync:
                 log.info("Calendar: removed event %s", event_id)
             return
 
-        desired = desired_events(ev, handle, self.tz, self._now())
-        had_any = bool(state["days"])
+        if booked:
+            desired = {BOOKED: booked_event(ev, handle, self.tz, self._eventbrite_url(event_id, ev),
+                                            state.get("ticket"))}
+        else:
+            desired = desired_events(ev, handle, self.tz, self._now())
+        had_any = bool(state["days"]) or bool(state.get(BOOKED))
 
         # Idempotency: with nothing recorded, adopt whatever Google already has for this scoutId.
-        if not state["days"] and not state["booking"]:
+        if not state["days"] and not state["booking"] and not state.get(BOOKED):
             for item in await self._find(event_id):
                 key = item.get("extendedProperties", {}).get("private", {}).get("scoutKey") or item["id"]
-                if key == BOOKING:
-                    state["booking"] = item["id"]
+                if key in (BOOKING, BOOKED):
+                    state[key] = item["id"]
                 else:
                     state["days"][key] = item["id"]
 
         existing: dict[str, str] = dict(state["days"])
         if state["booking"]:
             existing[BOOKING] = state["booking"]
-        booking_passed = ev.booking_opens_at is not None and ev.booking_opens_at <= self._now()
+        if state.get(BOOKED):
+            existing[BOOKED] = state[BOOKED]
+        # Once booked, the "🎟 Book:" reminder goes too; otherwise a past reminder stays as a record.
+        booking_passed = (not booked and ev.booking_opens_at is not None
+                          and ev.booking_opens_at <= self._now())
 
         first_link: str | None = None
         created = patched = 0
@@ -446,15 +570,21 @@ class CalendarSync:
             if res is None:
                 res = await self._insert(body)
                 created += 1
-            if key == BOOKING:
-                state["booking"] = res["id"]
+            if key in (BOOKING, BOOKED):
+                state[key] = res["id"]
             else:
                 state["days"][key] = res["id"]
+            if key != BOOKING:
                 first_link = first_link or res.get("htmlLink")
             self._save_state(event_id, state)
 
         log.info("Calendar: event %s synced (%d created, %d updated)", event_id, created, patched)
-        if not had_any and state["days"]:
+        if reason == "booked" and booked:
+            when = ev.booked_start.astimezone(self.tz).strftime("%a %-d %b %H:%M")
+            await self._reply(ev, f"📅 Calendar: only your booked slot is left — {when}", first_link)
+        elif reason == "unbooked" and not booked and state["days"]:
+            await self._reply(ev, "📅 Calendar: booking cleared, all dates are back", first_link)
+        elif not had_any and (state["days"] or state.get(BOOKED)):
             await self._reply(ev, "📅 Added to your Scout calendar", first_link)
         elif reason == "update" and (created or patched):
             what = "; ".join(changes) if changes else ev.title
@@ -464,8 +594,70 @@ class CalendarSync:
     def _drop(state: dict[str, Any], key: str) -> None:
         if key == BOOKING:
             state["booking"] = None
+        elif key == BOOKED:
+            state.pop(BOOKED, None)
         else:
             state["days"].pop(key, None)
+
+    # ---- ticket QR on Google Drive ---------------------------------------------
+    @property
+    def drive_folder(self) -> str:
+        return getattr(self.settings, "gdrive_folder_id", "") or os.environ.get("GDRIVE_FOLDER_ID", "")
+
+    async def upload_ticket(self, event_id: int, path: str | Path) -> dict[str, Any] | None:
+        """Upload the QR/ticket into GDRIVE_FOLDER_ID (never shared publicly). None when not possible:
+        no folder configured, quota exceeded (folder in a My Drive) or any other Drive error."""
+        folder = self.drive_folder
+        path = Path(path)
+        if not folder or not path.is_file():
+            return None
+        ev, _ = self._load(event_id)
+        title = f"Scout ticket #{event_id} — {ev.title if ev else ''}".strip(" —")[:120] + path.suffix.lower()
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        boundary = f"scout-{uuid.uuid4().hex}"
+        meta = json.dumps({"name": title, "parents": [folder], "mimeType": mime})
+        body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n"
+                f"--{boundary}\r\nContent-Type: {mime}\r\n\r\n").encode() + path.read_bytes() + \
+            f"\r\n--{boundary}--\r\n".encode()
+        try:
+            res = await self._call("POST", DRIVE_UPLOAD, content=body,
+                                   params={"uploadType": "multipart", "supportsAllDrives": "true",
+                                           "fields": "id,name,mimeType,webViewLink"},
+                                   headers_extra={"Content-Type": f"multipart/related; boundary={boundary}"})
+        except CalendarError as exc:
+            if exc.reason == "storageQuotaExceeded" or "storage quota" in str(exc).lower():
+                log.warning("Drive upload for event %s: service account has no storage quota — "
+                            "GDRIVE_FOLDER_ID must be a folder in a Shared Drive", event_id)
+                if self.db.get_setting(QUOTA_WARNED_KEY) != "1":
+                    self.db.set_setting(QUOTA_WARNED_KEY, "1")
+                    await self._send("ℹ️ I couldn't put the ticket in Google Drive: service accounts have no "
+                                     "storage in a personal My Drive. Use a folder in a Shared Drive (see README). "
+                                     "The ticket is pinned here in the chat instead.")
+            else:
+                log.warning("Drive upload for event %s failed (%s); ticket stays in Telegram only", event_id, exc)
+            return None
+        except Exception:  # noqa: BLE001
+            log.exception("Drive upload for event %s crashed", event_id)
+            return None
+        fid = res.get("id")
+        return {"fileId": fid, "title": res.get("name") or title, "mimeType": res.get("mimeType") or mime,
+                "fileUrl": res.get("webViewLink") or f"https://drive.google.com/open?id={fid}"}
+
+    async def attach_ticket(self, event_id: int, path: str | Path | None = None) -> bool:
+        """Upload (if a folder is configured) and re-sync so the booked entry carries the file."""
+        if path is None:
+            ev, _ = self._load(event_id)
+            path = ev.ticket_path if ev else None
+        if path:
+            ticket = await self.upload_ticket(event_id, path)
+            if ticket:
+                with self.db.session() as s:
+                    row = s.get(Event, event_id)
+                    if row:
+                        state = load_state(row.gcal_event_id)
+                        state["ticket"] = ticket
+                        row.gcal_event_id = dump_state(state)
+        return await self.sync(event_id, reason="ticket")
 
     # ---- Telegram feedback -------------------------------------------------------
     async def _send(self, text: str, reply_to: int | None = None, url: str | None = None) -> None:
@@ -509,16 +701,80 @@ class CalendarSync:
         if new == "yes" or old == "yes":
             self._spawn(self.sync(event_id, reason="decision"))
 
-    async def on_update(self, event_id: int, changes: list[str] | None = None, **_) -> None:  # noqa: ANN003
+    async def on_update(self, event_id: int, changes: list[str] | None = None, _silent: bool = False,
+                        **_) -> None:  # noqa: ANN003
         with self.db.session() as s:
             ev = s.get(Event, event_id)
             relevant = ev is not None and (ev.user_decision == "yes" or bool(ev.gcal_event_id))
         if relevant:
-            self._spawn(self.sync(event_id, reason="update", changes=changes))
+            self._spawn(self.sync(event_id, reason="silent" if _silent else "update", changes=changes))
+
+    async def on_booking(self, event_id: int, **_) -> None:  # noqa: ANN003
+        ev, _h = self._load(event_id)
+        if ev is not None and ev.ticket_path:
+            self._spawn(self._booked_with_ticket(event_id, ev.ticket_path))
+        else:
+            self._spawn(self.sync(event_id, reason="booked"))
+
+    async def _booked_with_ticket(self, event_id: int, path: str) -> None:
+        ticket = await self.upload_ticket(event_id, path)
+        if ticket:
+            with self.db.session() as s:
+                row = s.get(Event, event_id)
+                if row:
+                    state = load_state(row.gcal_event_id)
+                    state["ticket"] = ticket
+                    row.gcal_event_id = dump_state(state)
+        await self.sync(event_id, reason="booked")
+
+    async def on_ticket(self, event_id: int, path: str | None = None, **_) -> None:  # noqa: ANN003
+        self._spawn(self.attach_ticket(event_id, path))
+
+    async def on_note(self, event_id: int, **_) -> None:  # noqa: ANN003
+        await self.on_update(event_id, changes=None, _silent=True)
+
+    async def on_merged(self, event_id: int, merged_id: int | None = None, **_) -> None:  # noqa: ANN003
+        if merged_id is not None:
+            self._spawn(self.remove_merged(event_id, merged_id))
+
+    async def remove_merged(self, kept_id: int, merged_id: int) -> None:
+        """Delete every calendar entry of the folded-in event (looked up in Google if its row is gone)."""
+        lock = self._locks.setdefault(merged_id, asyncio.Lock())
+        async with lock:
+            try:
+                ev, _ = self._load(merged_id)
+                state = load_state(ev.gcal_event_id) if ev else {"days": {}, "booking": None}
+                kept, _h = self._load(kept_id)
+                kept_ids = set()
+                if kept is not None:
+                    ks = load_state(kept.gcal_event_id)
+                    kept_ids = set(ks["days"].values()) | {ks["booking"], ks.get(BOOKED)}
+                gids = set(state["days"].values()) | {state["booking"], state.get(BOOKED)}
+                gids |= {i["id"] for i in await self._find(merged_id)}
+                for gid in gids - kept_ids - {None}:
+                    await self._delete(gid)
+                if ev is not None:
+                    with self.db.session() as s:
+                        row = s.get(Event, merged_id)
+                        if row:
+                            row.gcal_event_id = None
+                self._set_pending(merged_id, False)
+                log.info("Calendar: removed entries of merged event %s (kept %s)", merged_id, kept_id)
+            except CalendarError as exc:
+                log.warning("Calendar cleanup of merged event %s failed: %s", merged_id, exc)
+        await self.on_update(kept_id, _silent=True)
 
     def register_hooks(self) -> None:
         hooks.on("decision_changed", self.on_decision)
         hooks.on("event_updated", self.on_update)
+        hooks.on("booking_confirmed", self.on_booking)
+        hooks.on("ticket_added", self.on_ticket)
+        hooks.on("note_added", self.on_note)
+        hooks.on("events_merged", self.on_merged)
+
+    async def unbooked(self, event_id: int) -> bool:
+        """Called after scout.bookings.clear_booking: bring all dates back."""
+        return await self.sync(event_id, reason="unbooked")
 
     async def retry(self) -> int:
         """Retry pending syncs and create entries for ✅ events that gained dates. Returns successes."""
@@ -562,7 +818,7 @@ def setup_calendar(app, settings, db: Database) -> CalendarSync | None:  # noqa:
         log.info("Google Calendar sync disabled (GCAL_SA_JSON / GCAL_CALENDAR_ID not set)")
         return None
     try:
-        sync = CalendarSync(settings, db, app)
+        sync = CalendarSync(settings, db, app)  # scopes: GOOGLE_SCOPES or calendar.events + drive.file
     except Exception as exc:  # noqa: BLE001 — bad JSON must not stop the bot; never log the key itself
         log.error("Google Calendar sync disabled: GCAL_SA_JSON is not a valid service-account key (%s)",
                   type(exc).__name__)

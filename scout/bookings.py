@@ -52,3 +52,58 @@ async def attach_ticket(db: Database, event_id: int, path: Path | str) -> None:
             return
         ev.ticket_path = str(path)
     await hooks.emit("ticket_added", event_id, path=str(path))
+
+
+async def clear_booking(db: Database, event_id: int) -> Event | None:
+    """Forget a booked slot (/unbook). The ticket file stays on disk; the calendar is restored by the
+    caller (CalendarSync.unbooked) because there is no hook signal for it."""
+    with db.session() as s:
+        ev = s.get(Event, event_id)
+        if ev is None:
+            return None
+        had = ev.booked_start is not None
+        ev.booked_start = ev.booked_end = None
+        ev.booked_via = None
+        ev.ticket_path = None
+        if had:
+            ev.log_change("booking cleared")
+    if had:
+        log.info("Booking cleared event=%s", event_id)
+    return ev
+
+
+async def add_note(db: Database, event_id: int, text: str) -> Event | None:
+    text = " ".join(text.split())
+    if not text:
+        return None
+    with db.session() as s:
+        ev = s.get(Event, event_id)
+        if ev is None:
+            return None
+        ev.add_note(text)
+    await hooks.emit("note_added", event_id, text=text)
+    return ev
+
+
+async def delete_note(db: Database, event_id: int, index: int) -> str | None:
+    """Delete the 1-based note `index`. Returns its text, or None if there is no such note."""
+    import json
+
+    with db.session() as s:
+        ev = s.get(Event, event_id)
+        if ev is None:
+            return None
+        notes = ev.note_list
+        if not 1 <= index <= len(notes):
+            return None
+        gone = notes.pop(index - 1)
+        ev.notes = json.dumps(notes, ensure_ascii=False)
+    # The calendar description lists notes, so it refreshes on the same signal.
+    await hooks.emit("note_added", event_id, text="")
+    return gone.get("text", "")
+
+
+def ticket_dir(data_dir: Path | str) -> Path:
+    d = Path(data_dir) / "tickets"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
