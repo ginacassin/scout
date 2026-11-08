@@ -10,6 +10,7 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Application
 
+from scout.autobook import setup_autobook
 from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
 from scout.config import Settings
 from scout.db import Database
@@ -42,6 +43,7 @@ def main() -> None:
     scout = Scout(settings, db, build_source(settings), GeminiParser(settings.gemini_api_key, settings.gemini_model), notifier)
     BotHandlers(scout, db, notifier, settings).register(app)
     schedule_jobs(app, scout, settings, db)
+    setup_autobook(app, settings, db)
 
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
@@ -52,6 +54,7 @@ def main() -> None:
             ("list", "Accounts I follow"),
             ("check", "Check all accounts now"),
             ("status", "Last checks and Apify credit"),
+            ("autobook", "Auto-book free Eventbrite tickets"),
             ("pause", "Mute alerts"),
             ("resume", "Unmute alerts"),
             ("help", "What Scout does"),
