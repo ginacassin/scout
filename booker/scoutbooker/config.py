@@ -39,6 +39,10 @@ class Config:
     def shots_dir(self) -> Path:
         return self.profile_dir / "shots"
 
+    @property
+    def tickets_dir(self) -> Path:
+        return self.profile_dir / "tickets"
+
     @classmethod
     def from_env(cls) -> "Config":
         env = os.environ

@@ -18,6 +18,7 @@ from scout.config import Settings
 from scout.db import Database
 from scout.gcal import setup_calendar
 from scout.bot.booking_cmds import register_booking_cmds
+from scout.planner import setup_planner
 from scout.uptime import setup_uptime
 from scout.eventbrite import setup_booking_watcher
 from scout.parser.gemini import GeminiParser
@@ -55,7 +56,7 @@ def main() -> None:
     setup_calendar(app, settings, db)  # M2: no-op unless GCAL_SA_JSON and GCAL_CALENDAR_ID are set
     register_booking_cmds(app, settings, db, notifier)  # /booked, /note, tickets, market-day reminders
     app.add_error_handler(obs.ErrorReporter(settings.allowed_chat_id))
-    setup_autobook(app, settings, db)
+    setup_planner(app, settings, db, setup_autobook(app, settings, db))  # /plan; route-aware slot choice
     setup_uptime(app, settings, db)  # tells you only when Scout was down or checks keep failing
     register_admin(app, settings, db, notifier)  # /merge, in-place card refresh on updates/merges
 
@@ -73,6 +74,7 @@ def main() -> None:
             ("logs", "Recent warnings and errors"),
             ("autobook", "Auto-book free Eventbrite tickets"),
             ("merge", "Merge two duplicate markets"),
+            ("plan", "Your market route for a day"),
             ("pause", "Mute alerts"),
             ("resume", "Unmute alerts"),
             ("help", "What Scout does"),

@@ -5,8 +5,11 @@
             Reserve / Get tickets button is enabled, click it and find the checkout
             (iframe `/checkout-external` or a full-page checkout). If no button ever shows,
             open checkout-external?eid= directly.
-  3.        pick the quantity (exactly one ticket type, otherwise stop).
-  4.        loop: success? -> done.  captcha / payment form / non-zero amount / empty required
+  3.        timed slots (ticket classes like "Viernes 13 · 10:00–10:30", or a date/time picker on the
+            event page or in the checkout): pick the earliest one that fits job.constraints (Scout's
+            route planner, see slots.py); none fits -> stop with "no slot fits your route".
+            Then pick the quantity (exactly one ticket type left, otherwise stop).
+  4.        loop: success? -> done (then capture the ticket QR / PDF into /profile/tickets).  captcha / payment form / non-zero amount / empty required
             field / no button to press -> stop.  Otherwise press Register/Continue.
 Every stop calls `on_abort` *first* (the "book manually NOW" message), then takes a screenshot.
 """
@@ -22,6 +25,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from . import eb_selectors as S
+from . import slots as SL
 from .config import Config
 from .jobs import Job, utcnow
 
@@ -45,6 +49,8 @@ class BookResult:
     detail: str = ""
     screenshot: Path | None = None
     submitted: bool = False  # a final-looking button was pressed: the order may exist
+    slot: SL.Slot | None = None  # the timed slot we picked, if the event has them
+    ticket: Path | None = None   # captured QR png / ticket pdf
 
 
 AbortHook = Callable[[str, str, bool], Awaitable[None]]  # (code, detail, submitted)
@@ -62,6 +68,7 @@ class Attempt:
         self.clock = clock
         self.page = None
         self.submitted = False
+        self.chosen: SL.Slot | None = None
 
     # ------------------------------------------------------------------- entry
     async def run(self) -> BookResult:
@@ -73,7 +80,14 @@ class Attempt:
             except (asyncio.TimeoutError, TimeoutError):
                 raise Abort("timeout", f"no result after {budget}s") from None
             shot = await self._shot("booked")
-            return BookResult(True, "booked", screenshot=shot, submitted=True)
+            ticket = None
+            try:
+                ticket = await asyncio.wait_for(self._capture_ticket(), timeout=TICKET_BUDGET_S)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001  (never let the ticket spoil a booking)
+                log.warning("Ticket capture for %s failed", self.job.event_id, exc_info=True)
+            return BookResult(True, "booked", screenshot=shot, submitted=True, slot=self.chosen, ticket=ticket)
         except asyncio.CancelledError:
             raise
         except Abort as a:
@@ -92,7 +106,7 @@ class Attempt:
         log.warning("Booking %s stopped: %s %s", self.job.event_id, code, detail)
         await self.on_abort(code, detail, self.submitted)  # tell the user before anything slow
         shot = await self._shot(f"failed-{code}")
-        return BookResult(False, code, detail, shot, self.submitted)
+        return BookResult(False, code, detail, shot, self.submitted, slot=self.chosen)
 
     async def _shot(self, label: str) -> Path | None:
         if self.page is None:
@@ -116,7 +130,10 @@ class Attempt:
         await self._guard()
         await self._sleep_until(opens)
         frame = await self._open_checkout(opens)
-        await self._select_quantity(frame)
+        await self._wait_ready(frame, 5)
+        frame = self._refresh_frame(frame)
+        if not await self._pick_slot(frame):
+            await self._select_quantity(frame)
         await self._advance(frame)
 
     async def _sleep_until(self, when: datetime) -> None:
@@ -193,7 +210,15 @@ class Attempt:
     async def _checkout_ready(self, frame) -> bool:  # noqa: ANN001
         if await self._quantity_selects(frame):
             return True
-        return await self._first_usable(frame.get_by_role("button", name=S.ADVANCE_RE)) is not None
+        if await self._first_usable(frame.get_by_role("button", name=S.ADVANCE_RE)) is not None:
+            return True
+        # timed-entry checkout that starts with a date/time picker
+        if await self._picker_slots(frame, S.SLOT_PICK_SELECTOR_CHECKOUT):
+            return True
+        try:
+            return await frame.locator("[role=grid]").count() > 0
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _wait_ready(self, frame, timeout: float) -> None:  # noqa: ANN001
         """The iframe exists before its React app renders the ticket list."""
@@ -225,6 +250,8 @@ class Attempt:
                 if btn is not None:
                     seen_button = True
                     if await btn.is_enabled() and await btn.get_attribute("aria-disabled") != "true":
+                        if self.chosen is None:  # timed-entry pages may show the slots next to the button
+                            await self._pick_from_picker(page.main_frame, S.SLOT_PICK_SELECTOR_EVENT_PAGE)
                         log.info("Reserve button enabled, clicking")
                         await btn.click(timeout=5000)
                         frame = await self._wait_checkout_frame(20)
@@ -407,6 +434,256 @@ class Attempt:
                 await asyncio.sleep(0.5)  # let the new step finish rendering
                 return "step"
         return "timeout"
+
+    # ---------------------------------------------------------------- slots
+    def _ref_day(self):  # noqa: ANN202
+        return SL.constraint_day(self.job.constraints) or self.clock().astimezone(self.cfg.tz).date()
+
+    async def _ticket_rows(self, frame) -> list[SL.Slot | None]:  # noqa: ANN001
+        """Every ticket class with a quantity control, parsed as a slot (None when its name has no time)."""
+        try:
+            rows = await frame.evaluate(_ROWS_JS, S.INCREASE_RE.pattern)
+        except Exception:  # noqa: BLE001
+            return []
+        out = []
+        for r in rows or []:
+            out.append(SL.parse_slot(r.get("text", ""), self._ref_day(), self.cfg.tz, index=int(r["i"]),
+                                     kind=r.get("kind", "")))
+        return out
+
+    async def _picker_slots(self, frame, selector: str) -> list[SL.Slot]:  # noqa: ANN001
+        try:
+            items = await frame.evaluate(_PICKER_JS, [selector, S.SLOT_TIME_JS])
+        except Exception:  # noqa: BLE001
+            return []
+        out = []
+        for it in items or []:
+            sl = SL.parse_slot(it.get("text", ""), self._ref_day(), self.cfg.tz, index=int(it["i"]), kind="pick",
+                               available=None if not it.get("disabled") else False)
+            if sl is not None:
+                out.append(sl)
+        return out
+
+    async def _click_date(self, frame) -> bool:  # noqa: ANN001
+        day = SL.constraint_day(self.job.constraints)
+        if day is None:
+            return False
+        try:
+            i = await frame.evaluate(_DATE_JS, [SL.date_patterns(day), str(day.day), S.CALENDAR_SELECTOR])
+        except Exception:  # noqa: BLE001
+            return False
+        if i is None:
+            return False
+        try:
+            await frame.locator(f'[data-scout-date="{i}"]').first.click(timeout=5000)
+        except Exception:  # noqa: BLE001
+            return False
+        log.info("Picked date %s in the date picker", day)
+        return True
+
+    def _no_fit(self, rejected) -> None:  # noqa: ANN001
+        raise Abort("no_slot_fits", SL.describe(rejected, self.cfg.tz))
+
+    def _remember(self, slot: SL.Slot) -> None:
+        self.chosen = slot
+        log.info("Chose slot %s (%s)", slot.short(self.cfg.tz), slot.label)
+
+    async def _pick_from_picker(self, frame, selector: str) -> bool:  # noqa: ANN001
+        """Click the best time button in a date/time picker. False when there's no picker."""
+        picks = await self._picker_slots(frame, selector)
+        if not picks and await self._click_date(frame):
+            end = time.monotonic() + 6
+            while not picks and time.monotonic() < end:
+                await asyncio.sleep(0.4)
+                picks = await self._picker_slots(frame, selector)
+        if not picks:
+            return False
+        chosen, rejected = SL.choose(picks, self.job.constraints, self.cfg.tz)
+        if chosen is None:
+            self._no_fit(rejected)
+        await frame.locator(f'[data-scout-pick="{chosen.index}"]').first.click(timeout=5000)
+        self._remember(chosen)
+        await asyncio.sleep(0.8)  # the picker re-renders (ticket list / continue button)
+        return True
+
+    async def _pick_slot(self, frame) -> bool:  # noqa: ANN001
+        """Timed ticket classes: set the quantity on the chosen one and return True (quantity done).
+        Picker: click the time and return False (the quantity step still runs). No slots: False."""
+        rows = await self._ticket_rows(frame)
+        timed = [r for r in rows if r is not None]
+        if timed:
+            chosen, rejected = SL.choose(timed, self.job.constraints, self.cfg.tz)
+            if chosen is None:
+                self._no_fit(rejected)
+            await self._set_row_quantity(frame, chosen)
+            self._remember(chosen)
+            return True
+        if len(rows) > 1 or self.chosen is not None:
+            return False  # several untimed ticket types -> _select_quantity stops as before
+        await self._pick_from_picker(frame, S.SLOT_PICK_SELECTOR_CHECKOUT)
+        return False
+
+    async def _set_row_quantity(self, frame, slot: SL.Slot) -> None:  # noqa: ANN001
+        q = self.job.quantity
+        el = frame.locator(f'[data-scout-slot="{slot.index}"]').first
+        if slot.kind == "select":
+            values = await el.evaluate("el => Array.from(el.options).map(o => o.value)")
+            if str(q) not in values:
+                raise Abort("quantity", f"wanted {q}, options {values[:8]}")
+            await el.select_option(str(q), timeout=5000)
+        else:
+            for _ in range(q):
+                await el.click(timeout=5000)
+                await asyncio.sleep(0.2)
+        log.info("Quantity %s set on slot %s", q, slot.label)
+
+    # --------------------------------------------------------------- ticket
+    def _ticket_path(self, ext: str) -> Path:
+        self.cfg.tickets_dir.mkdir(parents=True, exist_ok=True)
+        return self.cfg.tickets_dir / f"{self.job.event_id}.{ext}"
+
+    async def _qr_shot(self, page) -> Path | None:  # noqa: ANN001
+        for f in page.frames:
+            for sel in S.TICKET_QR_SELECTORS:
+                try:
+                    el = await self._first_usable(f.locator(sel), need_enabled=False)
+                    if el is None:
+                        continue
+                    box = await el.bounding_box()
+                    if not box or box["width"] < 60 or box["height"] < 60:
+                        continue  # icons, not a scannable code
+                    path = self._ticket_path("png")
+                    await el.screenshot(path=str(path), timeout=5000)
+                    log.info("Ticket QR captured with %s", sel)
+                    return path
+                except Exception:  # noqa: BLE001
+                    continue
+        return None
+
+    async def _find_link(self, page, pattern):  # noqa: ANN001, ANN202
+        for f in page.frames:
+            for role in ("link", "button"):
+                el = await self._first_usable(f.get_by_role(role, name=pattern))
+                if el is not None:
+                    return el
+        return None
+
+    async def _capture_ticket(self) -> Path | None:
+        """(a) QR on the confirmation page, (b) QR on the order's "Ver entradas" page, (c) ticket PDF."""
+        page = self.page
+        await asyncio.sleep(1.5)  # let the confirmation render its ticket
+        if (p := await self._qr_shot(page)) is not None:
+            return p
+        link = await self._find_link(page, S.MY_TICKETS_RE)
+        if link is not None:
+            try:
+                href = await link.get_attribute("href")
+                target = page
+                if href and href.startswith(("http", "/")):
+                    target = await self.ctx.new_page()
+                    await target.goto(href if href.startswith("http") else self.cfg.base_url + href,
+                                      wait_until="domcontentloaded", timeout=20_000)
+                else:
+                    await link.click(timeout=5000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                await asyncio.sleep(2)
+                if (p := await self._qr_shot(target)) is not None:
+                    return p
+                if (p := await self._download_pdf(target)) is not None:
+                    return p
+            except Exception:  # noqa: BLE001
+                log.warning("My-tickets page didn't give a QR", exc_info=True)
+        return await self._download_pdf(page)
+
+    async def _download_pdf(self, page) -> Path | None:  # noqa: ANN001
+        el = await self._find_link(page, S.DOWNLOAD_TICKET_RE)
+        if el is None:
+            for f in page.frames:
+                el = await self._first_usable(f.locator("a[href*='.pdf' i], a[href*='pdf' i][href*='ticket' i]"),
+                                              need_enabled=False)
+                if el is not None:
+                    break
+        if el is None:
+            return None
+        href = await el.get_attribute("href")
+        if href and href.startswith(("http", "/")):
+            url = href if href.startswith("http") else self.cfg.base_url + href
+            r = await self.ctx.request.get(url, timeout=20_000)
+            body = await r.body()
+            if r.ok and body[:4] == b"%PDF":
+                path = self._ticket_path("pdf")
+                path.write_bytes(body)
+                log.info("Ticket PDF downloaded")
+                return path
+        async with page.expect_download(timeout=20_000) as info:
+            await el.click(timeout=5000)
+        dl = await info.value
+        path = self._ticket_path("pdf")
+        await dl.save_as(str(path))
+        log.info("Ticket PDF downloaded via click")
+        return path
+
+
+TICKET_BUDGET_S = 60
+
+# Marks each ticket-class quantity control with data-scout-slot=i and returns the text of its row
+# (the largest ancestor that contains no other quantity control).
+_ROWS_JS = r"""(incSrc) => {
+  const inc = new RegExp(incSrc, 'i');
+  const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const isQty = s => { const v = Array.from(s.options).map(o => o.value.trim()).filter(x => x !== '');
+                       return v.length >= 2 && v.every(x => /^\d+$/.test(x) && +x <= 100); };
+  const controls = [];
+  document.querySelectorAll('select').forEach(s => { if (vis(s) && isQty(s)) controls.push([s, 'select']); });
+  document.querySelectorAll('button,[role=button]').forEach(b => {
+    const n = (b.getAttribute('aria-label') || b.innerText || '').trim();
+    if (vis(b) && inc.test(n)) controls.push([b, 'stepper']);
+  });
+  const all = controls.map(c => c[0]);
+  return controls.map(([el, kind], i) => {
+    let box = el;
+    while (box.parentElement && box.parentElement !== document.body) {
+      const p = box.parentElement;
+      if (all.some(o => o !== el && p.contains(o))) break;
+      box = p;
+      if ((box.innerText || '').length > 400) break;
+    }
+    el.setAttribute('data-scout-slot', String(i));
+    return {i, kind, text: (box.innerText || '').slice(0, 300)};
+  });
+}"""
+
+# Marks each clickable time-slot button with data-scout-pick=i (innermost matches only).
+_PICKER_JS = r"""([selector, timeSrc]) => {
+  const re = new RegExp(timeSrc, 'i');
+  const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const label = el => ((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')).trim();
+  const found = Array.from(document.querySelectorAll(selector)).filter(el => {
+    const t = label(el); return vis(el) && t.length <= 90 && re.test(t);
+  });
+  const inner = found.filter(el => !found.some(o => o !== el && el.contains(o)));
+  return inner.slice(0, 80).map((el, i) => {
+    el.setAttribute('data-scout-pick', String(i));
+    const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true' ||
+                     /disabled|unavailable|sold/i.test(el.className || '');
+    return {i, text: label(el), disabled};
+  });
+}"""
+
+# Marks the date-picker cell for the wanted day with data-scout-date=0; returns 0 or null.
+_DATE_JS = r"""([patterns, dayNum, calSel]) => {
+  const res = patterns.map(p => new RegExp(p, 'i'));
+  const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const usable = el => vis(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+  const sel = "button, [role=button], [role=gridcell], [role=option], [role=radio], [role=tab], td";
+  const els = Array.from(document.querySelectorAll(sel)).filter(usable);
+  const label = el => ((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')).trim();
+  let hit = els.find(el => res.some(r => r.test(label(el))));
+  if (!hit) hit = els.find(el => (el.innerText || '').trim() === dayNum && el.closest(calSel));
+  if (!hit) return null;
+  hit.setAttribute('data-scout-date', '0');
+  return 0;
+}"""
 
 
 async def book(ctx, job: Job, cfg: Config, check_login: LoginCheck, on_abort: AbortHook) -> BookResult:  # noqa: ANN001

@@ -71,9 +71,10 @@ while logged out.
 
 | Method | Path | Body / result |
 |---|---|---|
-| POST | `/book` | `{event_id, eventbrite_id, event_url, opens_at (ISO), title, quantity?}` → `{job, changed}`; 409 if already attempted |
+| POST | `/book` | `{event_id, eventbrite_id, event_url, opens_at (ISO), title, quantity?, constraints?}` → `{job, changed}`; 409 if already attempted. Re-posting with new `constraints` updates the job silently |
 | DELETE | `/book/{event_id}` | cancel; 409 once the attempt has started at/after opening |
-| GET | `/jobs` | `{jobs: [...]}` with `state`: scheduled, running, booked, failed:&lt;reason&gt;, cancelled |
+| GET | `/jobs` | `{jobs: [...]}` with `state`: scheduled, running, booked, failed:&lt;reason&gt;, cancelled; plus `slot_start`/`slot_end` (ISO, Europe/Madrid), `slot_label`, `ticket` |
+| GET | `/jobs/{event_id}/ticket` | the captured ticket: QR `image/png` or `application/pdf`; 404 if none |
 | GET | `/health` | `{ok, logged_in: true/false/null, browser}` |
 | POST | `/check-login` | `{logged_in}` (opens eventbrite.es/account-settings/ in the profile) |
 | POST | `/login/start` | `{ok, vnc_url, closes_in_s}` |
@@ -86,10 +87,23 @@ while logged out.
   Get tickets / Reserve a spot** is enabled (max 3 min), clicks it and finds the checkout iframe
   (`/checkout-external`). If the event page never shows such a button, it opens
   `checkout-external?eid=…` directly after 20 s.
-* Picks the quantity (stops if there are several ticket types to choose from).
+* **Timed slots** ("citas"): if the ticket types are slots ("Viernes 13 · 10:00–10:30") or the page shows a
+  date/time picker (on the event page or inside the checkout), it parses every slot and takes the
+  **earliest available one that fits the route** Scout sent in `constraints`:
+  ```json
+  {"date": "2026-11-13", "earliest": "10:00", "latest": "13:00", "avoid": [["10:05", "11:55"]],
+   "prefer": "earliest", "visit_minutes": 30}
+  ```
+  Right day, inside earliest/latest, and for every avoid window `[lo, hi]`: start ≥ hi, or
+  start + max(0, slot length − visit) ≤ lo. Nothing fits → stops with **"no slot fits your route"** and lists
+  the slots it saw. The chosen slot is stored on the job and shown in "✅ Booked!".
+* Picks the quantity (stops if there are several *untimed* ticket types to choose from).
 * Presses Register / Continue / Realizar pedido step by step. Before every press: captcha → stop;
   payment form or any non-zero amount → stop; empty required field → stop; can't confirm it's free → stop.
 * Success ("Gracias por tu pedido", order number, confirmation URL) → "✅ Booked!" with a screenshot.
+* Ticket: screenshots the QR on the confirmation page; else opens "Ver entradas / My tickets" and
+  screenshots the QR there; else downloads the ticket PDF. Saved as `/profile/tickets/<event_id>.png|pdf`,
+  served at `GET /jobs/{event_id}/ticket`. Scout fetches it within a minute and records the booking.
 
 Screenshots of every attempt are kept in `/profile/shots/`.
 
@@ -113,3 +127,9 @@ already on sale (arm it with an opening time 3 minutes ahead via `POST /book`) a
 4. Logged-in checkout prefills name/email (no empty required fields) and the button labels match `ADVANCE_RE`.
 5. The confirmation page matches `SUCCESS_TEXT_RE` / `SUCCESS_URL_RE`.
 6. Chromium runs with 1 GB shm on the Pi and the Playwright image tag `v1.63.0-noble` pulls for arm64.
+7. Timed-entry event: the slots show up either as ticket types with a quantity `<select>`/stepper each
+   (row text contains the time) or as buttons in a date/time picker; the date cell's label matches
+   `slots.date_patterns`; "Comprobar disponibilidad"/"Check availability" opens the checkout.
+8. Slot labels parse (`slots.parse_slot`): check the times in the "✅ Booked!" message match the email.
+9. Confirmation page / My tickets: a QR element matches `TICKET_QR_SELECTORS`, or "Descargar entradas"
+   gives a PDF. Look at `/profile/tickets/` after the dry run.

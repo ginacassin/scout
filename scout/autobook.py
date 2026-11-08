@@ -3,17 +3,26 @@
 Scout only arms/cancels jobs and shows buttons; the booker container (booker/) owns the browser,
 does the attempt at the opening second and messages the user itself.
 
+Each job carries `constraints` from scout/planner.py (which timed slots fit around the markets you
+already booked that day); they are re-sent whenever a booking is confirmed. When the booker reports a
+job as booked, Scout downloads the ticket (GET /jobs/{id}/ticket) to DATA_DIR/tickets/ and records the
+slot once via bookings.record_booking (which fires booking_confirmed -> calendar + re-plan).
+
+Sync runs every minute while an armed job opens within 30 min (or opened in the last 20), else every 10.
+
 Env: BOOKER_URL (default http://scout-booker:8100, "off" disables), BOOKER_TOKEN (shared secret).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
+from pathlib import Path
 
 import httpx
 from sqlalchemy import select
@@ -21,7 +30,7 @@ from telegram import InlineKeyboardButton, Update
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, filters
 
-from . import hooks
+from . import bookings, hooks
 from .bot import templates as T
 from .db import BookingWatch, Database, Event, utcnow
 
@@ -31,7 +40,11 @@ DEFAULT_URL = "http://scout-booker:8100"
 OFF_VALUES = {"off", "0", "false", "no", "none", "disabled"}
 CALLBACK_RE = re.compile(r"^ab:(on|off):(\d+)$")
 SYNC_EVERY_S = 600          # re-sync armed jobs (opening time may move)
+FAST_SYNC_S = 60            # ...every minute around an opening, to learn the booked slot quickly
+FAST_BEFORE = timedelta(minutes=30)
+FAST_AFTER = timedelta(minutes=20)
 HEALTH_RETRY_S = 3600       # while the booker is unreachable, look again hourly
+PLAN_TIMEOUT_S = 10         # geocoding/routing must not hold up a button tap
 
 STATE_LABEL = {
     "scheduled": "armed",
@@ -77,6 +90,13 @@ class BookerClient:
     async def jobs(self) -> tuple[int, dict]:
         return await self._call("GET", "/jobs")
 
+    async def ticket(self, event_id: int) -> tuple[int, bytes, str]:
+        """(status, body, content-type) of the captured ticket file."""
+        async with httpx.AsyncClient(base_url=self.base_url, headers=self.headers, timeout=30,
+                                     transport=self.transport) as c:
+            r = await c.get(f"/jobs/{event_id}/ticket")
+        return r.status_code, r.content, r.headers.get("content-type", "")
+
     async def check_login(self) -> tuple[int, dict]:
         return await self._call("POST", "/check-login", timeout=60)
 
@@ -114,6 +134,8 @@ class AutoBook:
         self.enabled = False
         self._warned = False
         self._last_health = 0.0
+        self._last_sync = 0.0
+        self.planner = None  # scout.planner.Planner, set by setup_planner
 
     # ---------------------------------------------------------------- health
     async def check_health(self) -> bool:
@@ -185,6 +207,9 @@ class AutoBook:
             "opens_at": w.opens_at.isoformat(),
             "title": ev.title,
         }
+        constraints = await self._constraints(ev.id)
+        if constraints is not None:
+            payload["constraints"] = constraints
         try:
             status, data = await self.client.book(payload)
         except httpx.HTTPError:
@@ -198,6 +223,17 @@ class AutoBook:
             return f"The booker refused: {data.get('error') or status}.", True
         self._set(event_id, True, job.get("state", "scheduled"))
         return f"🤖 Armed — I'll try at {self._fmt(w.opens_at)}.", False
+
+    async def _constraints(self, event_id: int) -> dict | None:
+        if self.planner is None:
+            return None
+        try:
+            return await asyncio.wait_for(self.planner.constraints(event_id), timeout=PLAN_TIMEOUT_S)
+        except (asyncio.TimeoutError, TimeoutError):
+            log.warning("Planning event %s took too long; arming without route constraints for now", event_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Planning event %s failed", event_id)
+        return None
 
     async def disarm(self, event_id: int) -> tuple[str, bool]:
         if self.client is None:
@@ -244,12 +280,29 @@ class AutoBook:
             toast, _ = await self.disarm(event_id)
             log.info("Event %s no longer ✅: %s", event_id, toast)
 
+    def _fast(self, now: datetime | None = None) -> bool:
+        """An armed job opens within 30 min (or opened in the last 20): sync every minute."""
+        now = now or utcnow()
+        with self.db.session() as s:
+            opens = list(s.scalars(select(BookingWatch.opens_at).where(BookingWatch.autobook.is_(True))))
+        return any(o is not None and now - FAST_AFTER <= o <= now + FAST_BEFORE for o in opens)
+
+    def sync_due(self) -> bool:
+        if not self._last_sync:
+            return True
+        interval = FAST_SYNC_S if self._fast() else SYNC_EVERY_S
+        return time.monotonic() - self._last_sync >= interval - 5
+
     async def tick(self, ctx: ContextTypes.DEFAULT_TYPE | None = None) -> None:
-        """Every 10 min: health (hourly while down) and keep armed jobs in step with the watcher's data."""
+        """Runs every minute; does real work every minute near an opening, else every 10 min:
+        health (hourly while down) and keep armed jobs in step with the watcher's data."""
+        if not self.sync_due():
+            return
         if not self.enabled and self._last_health and time.monotonic() - self._last_health < HEALTH_RETRY_S:
             return
         if not await self.check_health():
             return
+        self._last_sync = time.monotonic()
         try:
             await self.sync()
         except httpx.HTTPError:
@@ -268,6 +321,12 @@ class AutoBook:
             ev, _ = self._load(w.event_id)
             if job and job.get("state") != "scheduled":
                 self._set(w.event_id, None, job.get("state"))
+                if job.get("state") == "booked":
+                    await self._learn_booking(w.event_id, job)
+                continue
+            if ev is not None and ev.booked_start is not None:
+                log.info("Event %s already has a slot (%s); cancelling its auto-book", w.event_id, ev.booked_via)
+                await self.disarm(w.event_id)
                 continue
             if not eligible(ev, w, now):
                 if w.opens_at is None or w.opens_at <= now:
@@ -277,6 +336,64 @@ class AutoBook:
             if job is None or _parse(job.get("opens_at")) != w.opens_at:
                 log.info("Re-arming event %s (booker had %s)", w.event_id, job and job.get("opens_at"))
                 await self.arm(w.event_id)
+            elif self.planner is not None:
+                fresh = await self._constraints(w.event_id)
+                if fresh is not None and job.get("constraints") != fresh:
+                    log.info("Re-arming event %s with new route constraints", w.event_id)
+                    await self.arm(w.event_id)
+
+    # ------------------------------------------------------ booked -> Scout
+    def _ticket_dir(self) -> Path:
+        return Path(self.settings.data_dir) / "tickets"
+
+    async def _fetch_ticket(self, event_id: int) -> Path | None:
+        try:
+            status, body, ctype = await self.client.ticket(event_id)
+        except httpx.HTTPError:
+            log.warning("Downloading the ticket for event %s failed", event_id, exc_info=True)
+            return None
+        if status != 200 or not body:
+            return None
+        ext = "pdf" if "pdf" in ctype or body[:4] == b"%PDF" else "png"
+        d = self._ticket_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{event_id}.{ext}"
+        path.write_bytes(body)
+        return path
+
+    def _fallback_slot(self, ev: Event, job: dict) -> tuple[datetime, datetime | None] | None:
+        """No timed slot (single untimed ticket): use the market's booked session on the planned day."""
+        cons = job.get("constraints") or {}
+        day = cons.get("date")
+        hm = cons.get("earliest")
+        if not day or not hm:
+            return None
+        start = datetime.fromisoformat(f"{day}T{hm}").replace(tzinfo=self.settings.tz)
+        end = (datetime.fromisoformat(f"{day}T{cons['latest']}").replace(tzinfo=self.settings.tz)
+               if cons.get("latest") else None)
+        return start, end
+
+    async def _learn_booking(self, event_id: int, job: dict) -> None:
+        """The booker got a slot: download the ticket and record the booking exactly once."""
+        ev, _ = self._load(event_id)
+        if ev is None:
+            return
+        if ev.booked_via == "auto" and ev.booked_start is not None:
+            if not ev.ticket_path and job.get("ticket"):  # ticket appeared after we recorded the slot
+                path = await self._fetch_ticket(event_id)
+                if path is not None:
+                    await bookings.attach_ticket(self.db, event_id, path)
+            return
+        start, end = _parse(job.get("slot_start")), _parse(job.get("slot_end"))
+        if start is None:
+            fb = self._fallback_slot(ev, job)
+            if fb is None:
+                log.warning("Event %s booked but the booker reported no slot time; not recording", event_id)
+                return
+            start, end = fb
+        path = await self._fetch_ticket(event_id) if job.get("ticket") else None
+        log.info("Auto-booked event %s: %s–%s ticket=%s", event_id, start, end, path)
+        await bookings.record_booking(self.db, event_id, start, end, via="auto", ticket_path=path)
 
     async def cmd_autobook(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
@@ -356,5 +473,5 @@ def setup_autobook(app: Application, settings, db: Database) -> AutoBook:  # noq
     hooks.on("decision_changed", ab.on_decision)
     app.add_handler(CallbackQueryHandler(ab.on_callback, pattern=r"^ab:"))
     if app.job_queue is not None:
-        app.job_queue.run_repeating(ab.tick, interval=SYNC_EVERY_S, first=5, name="autobook-sync")
+        app.job_queue.run_repeating(ab.tick, interval=FAST_SYNC_S, first=5, name="autobook-sync")
     return ab
