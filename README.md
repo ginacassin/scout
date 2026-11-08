@@ -25,6 +25,8 @@ Design document: see the "Scout — Design Document" in the scout project.
 | `/ticket <id>` | Send the QR/ticket PDF next (or send a photo/PDF captioned `/ticket <id>` any time) |
 | `/note <id> <text>` | Remember something for a market (or just reply to its card with the text) |
 | `/notes <id>` · `/delnote <id> <n>` | List or delete notes |
+| `/today` · `/briefing [date]` | Briefing of the markets you're visiting that day |
+| `/plan [date]` | Booked and armed markets in time order, with drive times |
 
 Cards of ✅ events show **🎟 I booked it** (Eventbrite markets: pick the day and time) and **📝 Add note**.
 Booked events show "🎟 Booked Fri 13 Nov 10:30 (by you/auto)" and notes appear on the card, in the
@@ -68,7 +70,9 @@ as history.
 - Posts and bios: 08:02, 11:02, 14:02, 17:02, 20:02, 23:02 (`POLL_HOURS`)
 - Stories: 21:07 daily (stories live 24 h)
 - Upkeep: 04:00 (past events, image pruning, retention cleanup)
-- Market-day reminders: 08:30 or 1 h before a booked slot (events with notes or a booking)
+- Morning briefing: 08:00 on days with ✅/booked markets (`BRIEFING_TIME`): time order, Instagram account, what's on sale, hours, address, notes, drive times, one Maps route
+- Reminder 1 h before a booked slot
+- Eventbrite login check for the auto-booker: 12:17 daily (warns once if logged out)
 
 About $3.80/month of Apify credit for 6 accounts, inside the free $5.
 
