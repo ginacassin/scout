@@ -595,14 +595,14 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
 
     async def upkeep_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         async with obs.trace("upkeep", swallow=True):
-            merged = scout.dedupe_events()
+            merged = await scout.dedupe_events()
             n = scout.mark_past_events()
             log.info("Upkeep: %d duplicate events merged", merged)
             removed = prune_media(settings.media_dir)
             log.info("Upkeep: %d events marked past, %d images pruned", n, removed)
 
     async def dedupe_once(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        n = scout.dedupe_events()
+        n = await scout.dedupe_events()
         if n:
             log.info("Startup: merged %d duplicate events", n)
 

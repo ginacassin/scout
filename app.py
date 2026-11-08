@@ -12,6 +12,7 @@ from telegram.ext import Application
 
 from scout import obs
 from scout.autobook import setup_autobook
+from scout.bot.admin import register_admin
 from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
 from scout.config import Settings
 from scout.db import Database
@@ -54,6 +55,7 @@ def main() -> None:
     app.add_error_handler(obs.ErrorReporter(settings.allowed_chat_id))
     setup_autobook(app, settings, db)
     setup_uptime(app, settings, db)  # tells you only when Scout was down or checks keep failing
+    register_admin(app, settings, db, notifier)  # /merge, in-place card refresh on updates/merges
 
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
@@ -68,6 +70,7 @@ def main() -> None:
             ("status", "Last checks, counters and Apify credit"),
             ("logs", "Recent warnings and errors"),
             ("autobook", "Auto-book free Eventbrite tickets"),
+            ("merge", "Merge two duplicate markets"),
             ("pause", "Mute alerts"),
             ("resume", "Unmute alerts"),
             ("help", "What Scout does"),
