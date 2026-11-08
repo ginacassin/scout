@@ -11,6 +11,7 @@ from telegram.error import TelegramError
 from telegram.ext import Application
 
 from scout import obs
+from scout.autobook import setup_autobook
 from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
 from scout.config import Settings
 from scout.db import Database
@@ -50,6 +51,7 @@ def main() -> None:
     schedule_jobs(app, scout, settings, db)
     setup_calendar(app, settings, db)  # M2: no-op unless GCAL_SA_JSON and GCAL_CALENDAR_ID are set
     app.add_error_handler(obs.ErrorReporter(settings.allowed_chat_id))
+    setup_autobook(app, settings, db)
 
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
@@ -63,6 +65,7 @@ def main() -> None:
             ("check", "Check all accounts now"),
             ("status", "Last checks, counters and Apify credit"),
             ("logs", "Recent warnings and errors"),
+            ("autobook", "Auto-book free Eventbrite tickets"),
             ("pause", "Mute alerts"),
             ("resume", "Unmute alerts"),
             ("help", "What Scout does"),

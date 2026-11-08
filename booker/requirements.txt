@@ -1,0 +1,4 @@
+# playwright must match the base image tag in Dockerfile (v1.63.0)
+playwright==1.63.0
+aiohttp==3.14.5
+httpx==0.28.1
