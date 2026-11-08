@@ -13,6 +13,7 @@ from telegram.ext import Application
 from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
 from scout.config import Settings
 from scout.db import Database
+from scout.gcal import setup_calendar
 from scout.parser.gemini import GeminiParser
 from scout.pipeline import Scout
 from scout.sources.apify import ApifySource
@@ -42,6 +43,7 @@ def main() -> None:
     scout = Scout(settings, db, build_source(settings), GeminiParser(settings.gemini_api_key, settings.gemini_model), notifier)
     BotHandlers(scout, db, notifier, settings).register(app)
     schedule_jobs(app, scout, settings, db)
+    setup_calendar(app, settings, db)  # M2: no-op unless GCAL_SA_JSON and GCAL_CALENDAR_ID are set
 
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
