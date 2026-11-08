@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from html import escape
 from pathlib import Path
 
 from sqlalchemy import select
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
@@ -18,10 +19,11 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
-from .. import hooks
+from .. import hooks, obs
 from ..db import Account, Database, Event
 from ..media import prune_media
 from . import templates as T
@@ -79,10 +81,14 @@ class TelegramNotifier:
         with self.db.session() as s:
             row = s.get(Event, ev.id)
             row.telegram_message_id = msg.message_id
+        obs.STATS.incr("alerts_sent")
+        log.info("card sent %s", obs.kv(event_id=ev.id, message_id=msg.message_id, decision=ev.user_decision,
+                                        header=header))
         return msg.message_id
 
     async def new_event(self, event: Event, kind: str) -> None:
         if self.paused:
+            log.info("alert held %s", obs.kv(event_id=event.id, reason="paused"))
             return  # sent on /resume
         header = "👀 Teaser: something's coming" if not event.date_list else "🆕 New market"
         try:
@@ -92,6 +98,7 @@ class TelegramNotifier:
 
     async def event_update(self, event: Event, changes: list[str]) -> None:
         if self.paused:
+            log.info("update held %s", obs.kv(event_id=event.id, reason="paused"))
             return
         handle = self._handle(event.account_id)
         confirmed = event.user_decision == "maybe" and any(c.startswith(("date", "address")) for c in changes)
@@ -113,8 +120,12 @@ class TelegramNotifier:
                 await self.app.bot.send_message(self.chat_id, text, parse_mode=ParseMode.HTML)
             except TelegramError:
                 log.exception("Could not send update for event %s", event.id)
+                return
         except TelegramError:
             log.exception("Could not send update for event %s", event.id)
+            return
+        obs.STATS.incr("alerts_sent")
+        log.info("update sent %s", obs.kv(event_id=event.id, changes=len(changes)))
 
     async def warn(self, text: str) -> None:
         try:
@@ -132,6 +143,43 @@ class TelegramNotifier:
         return len(pending)
 
 
+EVENTS_PAGE_SIZE = 8
+DECISION_EMOJI = {"pending": "🆕", "yes": "✅", "maybe": "🤔", "no": "❌", "filtered": "🌍"}
+EVENT_FILTERS: dict[str, str] = {  # code -> button label
+    "up": "Upcoming", "new": "New", "yes": "✅", "maybe": "🤔", "no": "❌", "out": "Outside Madrid", "past": "Past",
+}
+EVENT_FILTER_TITLES = {
+    "up": "Upcoming", "new": "New (not answered)", "yes": "✅ Going", "maybe": "🤔 Maybe", "no": "❌ Skipped",
+    "out": "Outside Madrid", "past": "Past",
+}
+# BadRequest texts after which a card can't be edited in place, so a fresh one is sent.
+UNEDITABLE = ("there is no caption in the message to edit", "there is no text in the message to edit",
+              "message can't be edited", "message to edit not found")
+
+
+def filter_events(evs: list[Event], code: str) -> list[Event]:
+    """Apply an /events filter and sort (soonest first; past: most recent first)."""
+    def live(e: Event) -> bool:
+        return e.status != "past"
+
+    preds = {
+        "up": lambda e: live(e) and e.user_decision != "filtered",
+        "new": lambda e: live(e) and e.user_decision == "pending",
+        "yes": lambda e: live(e) and e.user_decision == "yes",
+        "maybe": lambda e: live(e) and e.user_decision == "maybe",
+        "no": lambda e: live(e) and e.user_decision == "no",
+        "out": lambda e: live(e) and e.user_decision == "filtered",
+        "past": lambda e: not live(e),
+    }
+    out = [e for e in evs if preds.get(code, preds["up"])(e)]
+    out.sort(key=lambda e: (e.date_list[0] if e.date_list else date.max, e.id), reverse=code == "past")
+    return out
+
+
+def short_title(title: str, limit: int = 28) -> str:
+    return title if len(title) <= limit else title[: limit - 1] + "…"
+
+
 class BotHandlers:
     def __init__(self, scout, db: Database, notifier: TelegramNotifier, settings):  # noqa: ANN001
         self.scout = scout
@@ -142,15 +190,18 @@ class BotHandlers:
     # ------------------------------------------------------------- registration
     def register(self, app: Application) -> None:
         only_me = filters.Chat(chat_id=self.settings.allowed_chat_id)
+        # Runs first for every update: trace id + one log line; handling then continues in group 0.
+        app.add_handler(TypeHandler(Update, obs.make_update_logger(self.settings.allowed_chat_id)), group=-1)
         cmds = {
             "start": self.cmd_start, "help": self.cmd_help, "add": self.cmd_add, "remove": self.cmd_remove,
             "list": self.cmd_list, "upcoming": self.cmd_upcoming, "maybe": self.cmd_maybe, "check": self.cmd_check,
             "pause": self.cmd_pause, "resume": self.cmd_resume, "status": self.cmd_status,
+            "events": self.cmd_events, "logs": self.cmd_logs,
         }
         for name, fn in cmds.items():
             app.add_handler(CommandHandler(name, fn, filters=only_me))
         # Core prefixes only; feature modules own their own (eb:, ab:, cal:) with their own handlers.
-        app.add_handler(CallbackQueryHandler(self.on_callback, pattern=r"^(d|c|r|rc|rx|f):|^x$|^rx$"))
+        app.add_handler(CallbackQueryHandler(self.on_callback, pattern=r"^(d|c|r|rc|rx|f|ev|e):|^x$|^rx$"))
         app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, self.on_text))
 
     def _allowed(self, update: Update) -> bool:
@@ -260,9 +311,10 @@ class BotHandlers:
 
     async def _check_now(self, msg) -> None:  # noqa: ANN001
         try:
-            counts = await self.scout.poll_profiles()
-        except Exception:  # noqa: BLE001
-            log.exception("Manual check failed")
+            async with obs.trace("poll_profiles", trigger="manual"):
+                counts = await self.scout.poll_profiles()
+        except Exception:  # noqa: BLE001 - logged with traceback by obs.trace
+            log.warning("Manual check failed")
             await msg.edit_text("The check failed; I'll try again at the next scheduled run.")
             return
         new = sum(counts.values())
@@ -295,7 +347,75 @@ class BotHandlers:
             lines.append(f"Apify this month: ${used:.2f}" + (f" of ${cap:.2f}" if cap else ""))
         if failing:
             lines.append("⚠️ Not readable: " + ", ".join("@" + h for h in failing))
+        st = obs.STATS
+        lines += ["", f"Up for {st.uptime()} · Telegram: {self.settings.telegram_mode}"]
+        poll = st.runs.get("poll_profiles")
+        if poll:
+            lines.append(f"Last poll: {poll.finished_at.astimezone(tz):%a %-d %b %H:%M}, "
+                         f"{poll.duration_ms / 1000:.1f}s, {poll.outcome}")
+        c = st.counters
+        lines.append(f"Since start: {c['updates']} updates ({c['callbacks']} taps), {c['alerts_sent']} alerts, "
+                     f"{c['gemini_calls']} Gemini calls ({c['gemini_tokens']:,} tokens), {c['apify_runs']} Apify runs, "
+                     f"{c['errors']} errors")
+        if st.last_error_at:
+            lines.append(f"Last error: {st.last_error_at.astimezone(tz):%a %-d %b %H:%M} (see /logs)")
         await update.effective_message.reply_html("\n".join(lines))
+
+    async def cmd_logs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        args = [a.lower() for a in (ctx.args or [])]
+        level = logging.INFO if "all" in args else logging.WARNING
+        n = next((int(a) for a in args if a.isdigit()), 20)
+        n = max(1, min(n, 50))
+        lines = obs.recent(n, level)
+        if not lines:
+            await update.effective_message.reply_text(
+                "No warnings or errors since start." if level > logging.INFO else "No log records yet.")
+            return
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = "…" + text[-3999:]
+        await update.effective_message.reply_html(f"<pre>{escape(text)}</pre>")
+
+    # ------------------------------------------------------------------ /events
+    async def cmd_events(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        text, kb = self.events_page("up", 0)
+        await update.effective_message.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
+
+    def events_page(self, code: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+        """Text and keyboard for one page of /events."""
+        code = code if code in EVENT_FILTERS else "up"
+        with self.db.session() as s:
+            evs = filter_events(list(s.scalars(select(Event))), code)
+            handles = {a.id: a.handle for a in s.scalars(select(Account))}
+        pages = max(1, math.ceil(len(evs) / EVENTS_PAGE_SIZE))
+        page = max(0, min(page, pages - 1))
+        chunk = evs[page * EVENTS_PAGE_SIZE:(page + 1) * EVENTS_PAGE_SIZE]
+
+        head = f"<b>Events · {EVENT_FILTER_TITLES[code]}</b> ({len(evs)})"
+        if pages > 1:
+            head += f" — page {page + 1}/{pages}"
+        lines = [head, ""]
+        if not chunk:
+            lines.append("Nothing here.")
+        for e in chunk:
+            when = ", ".join(T.fmt_day(d) for d in e.date_list) if e.date_list else "date TBA"
+            where = e.address or e.area or "place TBA"
+            emoji = DECISION_EMOJI.get(e.user_decision, "•")
+            lines.append(f"{emoji} <b>#{e.id}</b> {escape(e.title)} — {escape(when)} — {escape(where)} "
+                         f"(@{escape(handles.get(e.account_id, '?'))})")
+
+        labels = [(c, ("• " if c == code else "") + label) for c, label in EVENT_FILTERS.items()]
+        rows = [[InlineKeyboardButton(lbl, callback_data=f"ev:{c}:0") for c, lbl in labels[:4]],
+                [InlineKeyboardButton(lbl, callback_data=f"ev:{c}:0") for c, lbl in labels[4:]]]
+        rows += [[InlineKeyboardButton(f"#{e.id} {short_title(e.title)}", callback_data=f"e:{e.id}")] for e in chunk]
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"ev:{code}:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"ev:{code}:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
 
     # ----------------------------------------------------------------- free text
     async def on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -311,73 +431,142 @@ class BotHandlers:
 
     # ------------------------------------------------------------------ buttons
     async def on_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Button taps. The query is answered exactly once (Telegram shows a spinner until then)."""
         q = update.callback_query
-        if not self._allowed(update):
-            await q.answer()
-            return
-        data = q.data or ""
+        answered = False
+
+        async def answer(text: str | None = None) -> None:
+            nonlocal answered
+            if answered:
+                return
+            answered = True
+            try:
+                await q.answer(text)
+            except TelegramError as exc:  # e.g. "query is too old" after a restart; the work still happens
+                log.warning("callback answer failed %s: %s", obs.kv(data=q.data), exc)
+
+        try:
+            if not self._allowed(update):
+                return
+            await self._dispatch(q, ctx, update, q.data or "", answer)
+        finally:
+            await answer()
+
+    async def _dispatch(self, q, ctx, update: Update, data: str, answer) -> None:  # noqa: ANN001
         if data == "x":
-            await q.answer()
-            await q.edit_message_text("OK, not following it.")
-            return
-        if data.startswith("f:"):
-            await q.answer()
+            await answer()
+            await self._edit_text(q, "OK, not following it.")
+        elif data.startswith("f:"):
+            await answer()
             handle = data[2:]
-            await q.edit_message_text(f"Checking @{handle} on Instagram…")
+            await self._edit_text(q, f"Checking @{handle} on Instagram…")
             ctx.application.create_task(self._follow_check(q.message, handle), update=update)
-            return
-        if data.startswith("r:"):
+        elif data.startswith("r:"):
+            await answer()
             handle = data[2:]
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Yes, remove @{handle}", callback_data=f"rc:{handle}"),
                                         InlineKeyboardButton("Cancel", callback_data="rx")]])
-            await q.answer()
-            await q.edit_message_text(f"Stop following @{handle}? Events already found stay in /upcoming.", reply_markup=kb)
-            return
-        if data.startswith("rc:"):
+            await self._edit_text(q, f"Stop following @{handle}? Events already found stay in /upcoming.", kb)
+        elif data.startswith("rc:"):
             handle = data[3:]
             ok = self.db.remove_account(handle)
-            await q.answer("Removed" if ok else "Already removed")
-            await q.edit_message_text(f"Stopped following @{handle}." if ok else f"@{handle} wasn't on the list.")
-            return
-        if data == "rx":
-            await q.answer()
-            await q.edit_message_text("Nothing removed.")
-            return
-        if data.startswith("d:"):
-            _, ev_id, decision = data.split(":")
-            await self._decide(q, int(ev_id), decision)
-            return
-        if data.startswith("c:"):
-            ev_id = int(data[2:])
+            log.info("account removed %s", obs.kv(handle=handle, ok=ok))
+            await answer("Removed" if ok else "Already removed")
+            await self._edit_text(q, f"Stopped following @{handle}." if ok else f"@{handle} wasn't on the list.")
+        elif data == "rx":
+            await answer()
+            await self._edit_text(q, "Nothing removed.")
+        elif data.startswith("d:"):
+            parts = data.split(":")
+            if len(parts) != 3 or not parts[1].isdigit():
+                log.warning("bad decision callback %s", obs.kv(data=data))
+                return
+            await self._decide(q, int(parts[1]), parts[2], answer)
+        elif data.startswith("c:"):
+            await answer()
             with self.db.session() as s:
-                ev = s.get(Event, ev_id)
-            await q.answer()
+                ev = s.get(Event, int(data[2:]))
             if ev:
-                await q.edit_message_reply_markup(T.decision_keyboard(ev, teaser=not ev.date_list))
-            return
-        await q.answer()
+                try:
+                    await q.edit_message_reply_markup(T.decision_keyboard(ev, teaser=not ev.date_list))
+                except BadRequest as exc:
+                    if "not modified" in str(exc).lower():
+                        return
+                    log.warning("change-answer edit failed, sending fresh card %s: %s", obs.kv(event_id=ev.id), exc)
+                    ev.user_decision = "pending"  # fresh card with decision buttons; DB keeps the old answer
+                    await self.notifier.send_event_card(ev)
+        elif data.startswith("ev:"):
+            await answer()
+            _, code, page = (data.split(":") + ["0"])[:3]
+            text, kb = self.events_page(code, int(page) if page.isdigit() else 0)
+            await self._edit_text(q, text, kb, html=True)
+        elif data.startswith("e:"):
+            with self.db.session() as s:
+                ev = s.get(Event, int(data[2:])) if data[2:].isdigit() else None
+            if not ev:
+                await answer("That market is no longer tracked.")
+                return
+            await answer()
+            await self.notifier.send_event_card(ev)
 
-    async def _decide(self, q, ev_id: int, decision: str) -> None:  # noqa: ANN001
+    async def _edit_text(self, q, text: str, kb: InlineKeyboardMarkup | None = None, html: bool = False) -> None:  # noqa: ANN001
+        """Edit the tapped message; a stale or identical message is logged, not raised."""
+        try:
+            await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML if html else None,
+                                      disable_web_page_preview=True)
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return
+            log.warning("edit failed, sending new message %s: %s", obs.kv(data=q.data), exc)
+            await q.get_bot().send_message(self.settings.allowed_chat_id, text, reply_markup=kb,
+                                           parse_mode=ParseMode.HTML if html else None)
+
+    async def _decide(self, q, ev_id: int, decision: str, answer=None) -> None:  # noqa: ANN001
+        """Store the answer, toast it, run hooks, then turn the card into an answered card."""
+        answer = answer or (lambda text=None: q.answer(text))
+        if decision not in ("yes", "maybe", "no"):
+            log.warning("unknown decision %s", obs.kv(event_id=ev_id, decision=decision))
+            await answer()
+            return
         with self.db.session() as s:
             ev = s.get(Event, ev_id)
             if not ev:
-                await q.answer("That market is no longer tracked.")
+                log.warning("decision for unknown event %s", obs.kv(event_id=ev_id, decision=decision))
+                await answer("That market is no longer tracked.")
                 return
             old = ev.user_decision
             ev.user_decision = decision
-            handle = s.get(Account, ev.account_id).handle
-        await hooks.emit("decision_changed", ev_id, old=old, new=decision)
+            acc = s.get(Account, ev.account_id)
+            handle = acc.handle if acc else "?"
+        log.info("decision %s", obs.kv(event_id=ev_id, old=old, new=decision, teaser=not ev.date_list))
         toast = {"yes": "Marked as going", "maybe": "I'll tell you when it's confirmed", "no": "Skipped"}[decision]
-        await q.answer(toast)
+        await answer(toast)
+        await hooks.emit("decision_changed", ev_id, old=old, new=decision)
+        await self._edit_card(q, ev, handle)
+
+    async def _edit_card(self, q, ev: Event, handle: str) -> None:  # noqa: ANN001
         caption = T.event_caption(ev, handle, self.settings.tz)
+        kb = T.answered_keyboard(ev)
+        msg = q.message if isinstance(q.message, Message) else None
         try:
-            if q.message and q.message.photo:
-                await q.edit_message_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=T.answered_keyboard(ev))
+            if msg is None:
+                raise BadRequest("Message to edit not found")
+            if msg.photo:
+                await q.edit_message_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
             else:
-                await q.edit_message_text(caption, parse_mode=ParseMode.HTML, reply_markup=T.answered_keyboard(ev))
+                await q.edit_message_text(caption, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                          disable_web_page_preview=True)
         except BadRequest as exc:
-            if "not modified" not in str(exc).lower():
-                raise
+            text = str(exc).lower()
+            if "not modified" in text:
+                log.info("card unchanged %s", obs.kv(event_id=ev.id))
+                return
+            if not any(u in text for u in UNEDITABLE):
+                log.warning("card edit failed %s: %s", obs.kv(event_id=ev.id), exc)
+            log.info("sending fresh card %s", obs.kv(event_id=ev.id, reason=str(exc)))
+            await self.notifier.send_event_card(ev)
+        else:
+            log.info("card edited %s", obs.kv(event_id=ev.id, decision=ev.user_decision))
 
 
 # ---------------------------------------------------------------------- jobs
@@ -386,24 +575,21 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
     tz = settings.tz
 
     async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
+        async with obs.trace("poll_profiles", swallow=True, job=ctx.job.name if ctx.job else None):
             counts = await scout.poll_profiles()
             log.info("Profile poll done: %s", counts)
             await _check_budget(scout, db, settings, app)
-        except Exception:  # noqa: BLE001
-            log.exception("Profile poll failed")
 
     async def stories_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
+        async with obs.trace("poll_stories", swallow=True):
             n = await scout.poll_stories()
             log.info("Story poll done: %d new", n)
-        except Exception:  # noqa: BLE001
-            log.exception("Story poll failed")
 
     async def upkeep_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        n = scout.mark_past_events()
-        removed = prune_media(settings.media_dir)
-        log.info("Upkeep: %d events marked past, %d images pruned", n, removed)
+        async with obs.trace("upkeep", swallow=True):
+            n = scout.mark_past_events()
+            removed = prune_media(settings.media_dir)
+            log.info("Upkeep: %d events marked past, %d images pruned", n, removed)
 
     for h in settings.poll_hours:
         jq.run_daily(poll_job, time(hour=h, minute=2, tzinfo=tz), name=f"poll-{h:02d}")
