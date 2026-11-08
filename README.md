@@ -20,12 +20,55 @@ Design document: see the "Scout — Design Document" in the scout project.
 | `/check` | Read all accounts now |
 | `/pause` · `/resume` | Mute and unmute alerts |
 | `/status` | Last check, failing accounts, Apify spend |
+| `/booked <id> <HH:MM> [date]` | You booked a slot yourself (date optional for one-day markets; buttons otherwise) |
+| `/unbook <id>` | Clear a booking; the calendar gets all dates back |
+| `/ticket <id>` | Send the QR/ticket PDF next (or send a photo/PDF captioned `/ticket <id>` any time) |
+| `/note <id> <text>` | Remember something for a market (or just reply to its card with the text) |
+| `/notes <id>` · `/delnote <id> <n>` | List or delete notes |
+
+Cards of ✅ events show **🎟 I booked it** (Eventbrite markets: pick the day and time) and **📝 Add note**.
+Booked events show "🎟 Booked Fri 13 Nov 10:30 (by you/auto)" and notes appear on the card, in the
+calendar description and in a market-day reminder (08:30, or 1 h before a booked slot) with the
+address and a Google Maps link.
+
+## Bookings and the calendar
+
+Saying ✅ puts every day of the market in the Scout calendar (plus a "🎟 Book:" reminder at the
+booking opening). As soon as a slot is booked — by the auto-booker or with `/booked` — those entries
+are deleted and **one timed entry** remains: "🎟 Alma Market — booked 10:30", with the full address,
+the Instagram and Eventbrite links, your notes, and who booked it. `/unbook` restores the dates.
+
+### Ticket QR on the calendar entry (optional, one-time setup)
+
+Google Calendar can only attach Google Drive files, and a service account has no Drive storage of
+its own, so uploads must go into a **Shared Drive** that the service account is a member of:
+
+1. Enable the **Google Drive API** in the Google Cloud project of the service account.
+2. In Google Drive create a Shared Drive (needs Google Workspace) or a folder inside one, and add the
+   service account email (`…@….iam.gserviceaccount.com`) as **Content manager**.
+3. Copy the folder id from its URL (`drive.google.com/drive/folders/<id>`) into `GDRIVE_FOLDER_ID`.
+
+Files are never made public: they are visible only to the Shared Drive's members. Scopes default to
+`calendar.events drive.file`; if uploads fail with "File not found" for the folder, set
+`GOOGLE_SCOPES=calendar.events drive`. With a personal @gmail.com account (no Shared Drives) or a
+folder in your own My Drive, the upload fails with `storageQuotaExceeded`; Scout tells you once and
+carries on. **Either way** the QR/PDF is sent to the chat as a reply to the event card and pinned,
+and the calendar entry says "Ticket QR: in your Scout chat (pinned)".
+
+## Data retention
+
+Events are marked past the day after they end and **deleted 14 days after their last day**
+(`RETENTION_DAYS`), together with their Eventbrite watch, images and ticket files; teasers that never
+got a date go after 60 days. Instagram items older than 30 days keep only their id (so a post is
+never processed twice) — caption, parsed data and images are dropped. Google Calendar entries stay
+as history.
 
 ## Schedule (Europe/Madrid)
 
 - Posts and bios: 08:02, 11:02, 14:02, 17:02, 20:02, 23:02 (`POLL_HOURS`)
 - Stories: 21:07 daily (stories live 24 h)
-- Upkeep: 04:00 (past events, image pruning)
+- Upkeep: 04:00 (past events, image pruning, retention cleanup)
+- Market-day reminders: 08:30 or 1 h before a booked slot (events with notes or a booking)
 
 About $3.80/month of Apify credit for 6 accounts, inside the free $5.
 
