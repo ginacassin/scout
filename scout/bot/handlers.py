@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from html import escape
 from pathlib import Path
 
@@ -26,6 +26,7 @@ from telegram.ext import (
 from .. import hooks, obs
 from ..db import Account, Database, Event
 from ..media import prune_media
+from ..pipeline import STORIES_AT_KEY
 from . import templates as T
 
 log = logging.getLogger(__name__)
@@ -248,10 +249,16 @@ class BotHandlers:
         last = f"\nLatest post: {latest.posted_at.astimezone(self.settings.tz):%-d %b}" if latest and latest.posted_at else ""
         name = f" ({escape(snap.full_name)})" if snap.full_name else ""
         verb = "Now following" if created else "Already following"
-        await msg.edit_text(f"✅ {verb} <b>@{escape(handle)}</b>{name}.{last}\nI'll read its recent posts now.",
+        await msg.edit_text(f"✅ {verb} <b>@{escape(handle)}</b>{name}.{last}\nI'll read its recent posts and current stories now.",
                             parse_mode=ParseMode.HTML)
         if created:
             await self.scout._process_profile(acc, snap)  # reuse the snapshot we already paid for
+            try:  # markets announced only in stories (e.g. @pujar_con_arte) would otherwise wait until the next story run
+                async with obs.trace("poll_stories", trigger="add", account=handle):
+                    n = await self.scout.poll_stories([handle])
+                log.info("Stories of new account @%s: %d new item(s)", handle, n)
+            except Exception:  # noqa: BLE001 - logged by obs.trace; the scheduled runs will pick them up
+                log.warning("Story check for new account @%s failed", handle)
 
     async def cmd_remove(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ctx.args:
@@ -318,7 +325,15 @@ class BotHandlers:
             await msg.edit_text("The check failed; I'll try again at the next scheduled run.")
             return
         new = sum(counts.values())
-        await msg.edit_text(f"Done. {len(counts)} accounts read, {new} new item(s) processed.")
+        story_note = ""
+        try:
+            async with obs.trace("poll_stories", trigger="manual"):
+                stories_new = await self.scout.poll_stories()
+            story_note = f" Stories: {stories_new} new."
+        except Exception:  # noqa: BLE001
+            log.warning("Manual story check failed")
+            story_note = " Stories couldn't be read this time."
+        await msg.edit_text(f"Done. {len(counts)} accounts read, {new} new item(s) processed.{story_note}")
 
     async def cmd_pause(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         self.db.set_setting("paused", "1")
@@ -339,7 +354,7 @@ class BotHandlers:
             "<b>Scout status</b>",
             f"Accounts: {len(accounts)}",
             f"Last successful check: {last.astimezone(tz):%a %-d %b %H:%M}" if last else "Last successful check: none yet",
-            "Checks: posts and bio at " + ", ".join(f"{h:02d}:00" for h in self.settings.poll_hours) + "; stories at 21:00",
+            "Checks: posts and bio at " + ", ".join(f"{h:02d}:00" for h in self.settings.poll_hours) + "; stories at " + " and ".join(f"{h:02d}:07" for h in STORY_HOURS),
             "Alerts: paused" if self.notifier.paused else "Alerts: on",
         ]
         if spend:
@@ -570,6 +585,8 @@ class BotHandlers:
 
 
 # ---------------------------------------------------------------------- jobs
+STORY_HOURS = (9, 21)  # Madrid time, at :07
+
 def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # noqa: ANN001
     jq = app.job_queue
     tz = settings.tz
@@ -610,7 +627,8 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
     jq.run_once(dedupe_once, when=timedelta(seconds=3), name="startup-dedupe")
     for h in settings.poll_hours:
         jq.run_daily(poll_job, time(hour=h, minute=2, tzinfo=tz), name=f"poll-{h:02d}")
-    jq.run_daily(stories_job, time(hour=21, minute=7, tzinfo=tz), name="stories")
+    for h in STORY_HOURS:  # stories live 24 h; two reads 12 h apart so none slips through
+        jq.run_daily(stories_job, time(hour=h, minute=7, tzinfo=tz), name=f"stories-{h:02d}")
     jq.run_daily(upkeep_job, time(hour=4, minute=0, tzinfo=tz), name="upkeep")
 
     # First run after a fresh install, or if the last good poll is older than 3 h.
@@ -618,6 +636,15 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
     stale = not beat.exists() or (datetime.now().timestamp() - beat.stat().st_mtime) > 3 * 3600
     if stale:
         jq.run_once(poll_job, when=timedelta(seconds=30), name="startup-poll")
+
+    # Catch up on stories after downtime or a deploy: if the last full story read is over 12 h old.
+    last_st = db.get_setting(STORIES_AT_KEY)
+    try:
+        st_age = (datetime.now(timezone.utc) - datetime.fromisoformat(last_st)).total_seconds() if last_st else None
+    except ValueError:
+        st_age = None
+    if st_age is None or st_age > 12 * 3600:
+        jq.run_once(stories_job, when=timedelta(seconds=90), name="startup-stories")
 
 
 async def _check_budget(scout, db: Database, settings, app: Application) -> None:  # noqa: ANN001

@@ -62,6 +62,9 @@ def bio_ig_id(handle: str, bio: str, links: list[str]) -> str:
     return f"bio:{handle}:{digest}"
 
 
+STORIES_AT_KEY = "stories_polled_at"
+
+
 class Scout:
     def __init__(self, settings: Settings, db: Database, source: InstagramSource, parser: Parser, notifier: Notifier,
                  tiebreaker=None):  # noqa: ANN001
@@ -97,12 +100,18 @@ class Scout:
         self.settings.heartbeat_file.touch()
         return counts
 
-    async def poll_stories(self) -> int:
+    async def poll_stories(self, handles: list[str] | None = None) -> int:
+        """Read current stories (they live 24 h) of all active accounts, or only of `handles`."""
         accounts = {a.handle: a for a in self.db.active_accounts()}
+        if handles is not None:
+            wanted = {h.lower() for h in handles}
+            accounts = {h: a for h, a in accounts.items() if h.lower() in wanted}
         if not accounts:
             return 0
         stories = await self.source.stories(list(accounts))
         log.info("poll stories %s", kv(accounts=len(accounts), stories=len(stories)))
+        if handles is None:
+            self.db.set_setting(STORIES_AT_KEY, utcnow().isoformat())
         new = 0
         for st in stories:
             acc = accounts.get(st.owner)

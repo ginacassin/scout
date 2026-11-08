@@ -184,13 +184,13 @@ def short_line(ev: Event, handle: str) -> str:
 
 HELP = (
     "<b>Scout</b> watches Instagram accounts for vintage markets and estate sales, and tells you when one is announced.\n\n"
-    "/add <i>@handle or URL</i> — follow an account\n"
+    "/add <i>@handle or URL</i> — follow an account (I read its posts and stories right away)\n"
     "/remove — stop following one\n"
     "/list — accounts I follow\n"
     "/upcoming — markets you said yes to\n"
     "/maybe — markets I'm watching for you\n"
     "/events — every market I track, with filters\n"
-    "/check — check all accounts now\n"
+    "/check — check all accounts now, stories included\n"
     "/pause · /resume — mute or unmute alerts\n"
     "/status — last checks and Apify credit\n"
     "/logs — recent warnings and errors (<code>/logs all</code> for everything)\n"

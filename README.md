@@ -13,11 +13,11 @@ Design document: see the "Scout — Design Document" in the scout project.
 
 | Command | What it does |
 | --- | --- |
-| `/add @handle` | Follow an account (or paste its profile link) |
+| `/add @handle` | Follow an account (or paste its profile link); reads its recent posts and current stories right away |
 | `/remove` | Stop following one |
 | `/list` | Accounts followed and when each was last read |
 | `/upcoming` · `/maybe` | Your ✅ and 🤔 markets, grouped by week |
-| `/check` | Read all accounts now |
+| `/check` | Read all accounts now (posts, bios and stories) |
 | `/pause` · `/resume` | Mute and unmute alerts |
 | `/status` | Last check, failing accounts, Apify spend |
 | `/booked <id> <HH:MM> [date]` | You booked a slot yourself (date optional for one-day markets; buttons otherwise) |
@@ -68,13 +68,13 @@ as history.
 ## Schedule (Europe/Madrid)
 
 - Posts and bios: 08:02, 11:02, 14:02, 17:02, 20:02, 23:02 (`POLL_HOURS`)
-- Stories: 21:07 daily (stories live 24 h)
+- Stories: 09:07 and 21:07 daily (stories live 24 h, so two reads 12 h apart catch every one); also on `/add` for the new account, and once after a restart if the last read is over 12 h old
 - Upkeep: 04:00 (past events, image pruning, retention cleanup)
 - Morning briefing: 08:00 on days with ✅/booked markets (`BRIEFING_TIME`): time order, Instagram account, what's on sale, hours, address, notes, drive times, one Maps route
 - Reminder 1 h before a booked slot
 - Eventbrite login check for the auto-booker: 12:17 daily (warns once if logged out)
 
-About $3.80/month of Apify credit for 6 accounts, inside the free $5.
+Apify cost: posts about $0.0027 per account per check (6 checks a day), stories $0.0025 per story found plus a small start fee per run. With 14 accounts that is roughly $9–11/month, above the free $5; Scout warns at 80 % of `APIFY_MONTHLY_BUDGET_USD`. Fewer `POLL_HOURS` is the cheapest lever.
 
 ## Deploy (Dokploy)
 
