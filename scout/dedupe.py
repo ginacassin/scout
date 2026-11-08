@@ -86,6 +86,8 @@ class GeminiTieBreaker:
             system_instruction=TIEBREAK_PROMPT, response_mime_type="application/json",
             response_schema=SameMarketVerdict, temperature=0.0,
         )
+        from .parser.gemini import LIMITER
+        await LIMITER.wait()  # shares the free-tier per-minute budget with the parser
         t0 = time.perf_counter()
         STATS.incr("gemini_calls")
         resp = await self.client.aio.models.generate_content(model=self.model, contents=[text], config=config)
