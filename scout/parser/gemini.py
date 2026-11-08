@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 from google import genai
 from google.genai import types
 
+from ..obs import STATS, kv
 from .prompt import SYSTEM_PROMPT, build_user_prompt
 from .schema import ParseResult
 
@@ -60,14 +62,29 @@ class GeminiParser:
         )
         last_exc: Exception | None = None
         for attempt in range(3):
+            t0 = time.perf_counter()
             try:
+                STATS.incr("gemini_calls")
                 resp = await self.client.aio.models.generate_content(model=self.model, contents=contents, config=config)
+                self._log_usage(resp, handle, item_kind, len(contents) - 1, int((time.perf_counter() - t0) * 1000))
                 if isinstance(resp.parsed, ParseResult):
                     return resp.parsed
                 return ParseResult.model_validate_json(resp.text or "{}")
             except Exception as exc:  # noqa: BLE001 - retried, then raised
                 last_exc = exc
-                log.warning("Gemini parse failed for @%s (attempt %d): %s", handle, attempt + 1, exc)
+                log.warning("Gemini parse failed %s: %s", kv(model=self.model, handle=handle, attempt=attempt + 1,
+                                                             latency_ms=int((time.perf_counter() - t0) * 1000)), exc)
                 await asyncio.sleep(2 ** attempt * 3)
         assert last_exc is not None
         raise last_exc
+
+    def _log_usage(self, resp, handle: str, item_kind: str, images: int, latency_ms: int) -> None:  # noqa: ANN001
+        usage = getattr(resp, "usage_metadata", None)
+        prompt = getattr(usage, "prompt_token_count", None)
+        cand = getattr(usage, "candidates_token_count", None)
+        total = getattr(usage, "total_token_count", None)
+        if isinstance(total, int):
+            STATS.incr("gemini_tokens", total)
+        log.info("gemini call %s", kv(model=self.model, handle=handle, item=item_kind, images=images,
+                                      latency_ms=latency_ms, prompt_tokens=prompt, candidates_tokens=cand,
+                                      total_tokens=total))

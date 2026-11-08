@@ -11,11 +11,13 @@ accounts, so `profiles()` re-runs once for any handle that did not come back.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from apify_client import ApifyClientAsync
 
+from ..obs import STATS, kv
 from .base import InstagramSource, PostItem, ProfileSnapshot, StoryItem
 
 log = logging.getLogger(__name__)
@@ -111,15 +113,23 @@ class ApifySource(InstagramSource):
         self.client = ApifyClientAsync(token)
 
     async def _run(self, actor: str, run_input: dict[str, Any], max_items: int) -> list[dict[str, Any]]:
-        run = await self.client.actor(actor).call(
-            run_input=run_input,
-            max_items=max_items,
-            run_timeout=timedelta(minutes=10),
-            logger=None,
-        )
-        if run is None or not run.default_dataset_id:
-            raise RuntimeError(f"Apify run of {actor} returned no dataset")
-        page = await self.client.dataset(run.default_dataset_id).list_items(clean=True)
+        t0 = time.perf_counter()
+        STATS.incr("apify_runs")
+        try:
+            run = await self.client.actor(actor).call(
+                run_input=run_input,
+                max_items=max_items,
+                run_timeout=timedelta(minutes=10),
+                logger=None,
+            )
+            if run is None or not run.default_dataset_id:
+                raise RuntimeError(f"Apify run of {actor} returned no dataset")
+            page = await self.client.dataset(run.default_dataset_id).list_items(clean=True)
+        except Exception as exc:
+            log.warning("apify run failed %s: %s", kv(actor=actor, duration_ms=int((time.perf_counter() - t0) * 1000)), exc)
+            raise
+        log.info("apify run %s", kv(actor=actor, run_id=getattr(run, "id", None), status=getattr(run, "status", None),
+                                    items=len(page.items), duration_ms=int((time.perf_counter() - t0) * 1000)))
         return page.items
 
     async def profiles(self, handles: list[str]) -> dict[str, ProfileSnapshot]:

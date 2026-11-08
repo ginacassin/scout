@@ -163,8 +163,10 @@ HELP = (
     "/list — accounts I follow\n"
     "/upcoming — markets you said yes to\n"
     "/maybe — markets I'm watching for you\n"
+    "/events — every market I track, with filters\n"
     "/check — check all accounts now\n"
     "/pause · /resume — mute or unmute alerts\n"
-    "/status — last checks and Apify credit\n\n"
+    "/status — last checks and Apify credit\n"
+    "/logs — recent warnings and errors (<code>/logs all</code> for everything)\n\n"
     "You can also paste an Instagram profile link."
 )

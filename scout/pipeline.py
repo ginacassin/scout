@@ -17,6 +17,7 @@ from .config import Settings
 from .db import Account, Database, Event, SourceItem, utcnow
 from .matching import MergeOutcome, event_status, find_match, parse_dates
 from .media import download_images
+from .obs import kv
 from .parser.schema import ItemKind, ParsedEvent, ParseResult, Region
 from .sources.base import InstagramSource, ProfileSnapshot
 
@@ -75,6 +76,9 @@ class Scout:
         if not accounts:
             return {}
         snaps = await self.source.profiles([a.handle for a in accounts])
+        missing = [a.handle for a in accounts if a.handle not in snaps]
+        log.info("poll profiles %s", kv(accounts=len(accounts), returned=len(snaps),
+                                        missing=",".join(missing) or None))
         counts: dict[str, int] = {}
         for acc in accounts:
             snap = snaps.get(acc.handle)
@@ -82,6 +86,8 @@ class Scout:
                 await self._record_failure(acc)
                 continue
             counts[acc.handle] = await self._process_profile(acc, snap)
+        log.info("poll profiles done %s", kv(processed=sum(counts.values()),
+                                             **{f"@{h}": n for h, n in counts.items() if n}))
         self.settings.heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
         self.settings.heartbeat_file.touch()
         return counts
@@ -91,6 +97,7 @@ class Scout:
         if not accounts:
             return 0
         stories = await self.source.stories(list(accounts))
+        log.info("poll stories %s", kv(accounts=len(accounts), stories=len(stories)))
         new = 0
         for st in stories:
             acc = accounts.get(st.owner)
@@ -177,10 +184,12 @@ class Scout:
 
     async def process(self, c: Candidate) -> int:
         if self._seen(c.ig_id):
+            log.debug("item seen %s", kv(ig_id=c.ig_id))
             return 0
         now = utcnow()
         reason = self.prefilter(c, now)
         if reason:
+            log.info("item %s", kv(ig_id=c.ig_id, kind=c.kind, account=c.account.handle, skipped=reason))
             with self.db.session() as s:
                 s.add(SourceItem(account_id=c.account.id, ig_id=c.ig_id, kind=c.kind, posted_at=c.posted_at,
                                  url=c.url, caption=c.caption, skipped_reason=reason))
@@ -218,6 +227,8 @@ class Scout:
             item_id = item.id
 
         if result.kind == ItemKind.unrelated or not result.events:
+            log.info("item %s", kv(ig_id=c.ig_id, kind=c.kind, account=c.account.handle,
+                                   classification=result.kind.value, events=0))
             return 1
 
         event_ids = []
@@ -227,6 +238,8 @@ class Scout:
                 event_ids.append(ev_id)
         with self.db.session() as s:
             s.get(SourceItem, item_id).event_ids = json.dumps(event_ids)
+        log.info("item %s", kv(ig_id=c.ig_id, kind=c.kind, account=c.account.handle, classification=result.kind.value,
+                               events=len(result.events), event_ids=",".join(map(str, event_ids)) or None))
         return 1
 
     def _candidates(self, s, c: Candidate, parsed: ParsedEvent) -> list[Event]:  # noqa: ANN001
@@ -253,8 +266,10 @@ class Scout:
                 ev_snapshot = ev
             else:
                 if pdates and max(pdates) < today:
+                    log.info("event dropped %s", kv(ig_id=c.ig_id, title=parsed.title[:60], reason="already_over"))
                     return None  # announcement of something already over
                 if kind in (ItemKind.reminder, ItemKind.update, ItemKind.last_day) and not pdates:
+                    log.info("event dropped %s", kv(ig_id=c.ig_id, title=parsed.title[:60], reason="followup_unseen"))
                     return None  # follow-up of a market Scout never saw; too little to alert on
                 ev = new_event_from(parsed, c, images, self.settings.tz)
                 ev.created_at = now
@@ -268,6 +283,10 @@ class Scout:
                 notify = not filtered
                 outcome = None
 
+        alert = bool(notify and (match is None or outcome))
+        log.info("event %s", kv(ig_id=c.ig_id, action="created" if match is None else "matched", event_id=ev_id,
+                                decision=ev_snapshot.user_decision, changes="; ".join(outcome.changes) if outcome and
+                                outcome.changes else None, alert=alert))
         if match is None and notify:
             await self.notifier.new_event(ev_snapshot, kind.value)
         elif match is not None and notify and outcome:

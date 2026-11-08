@@ -10,6 +10,7 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Application
 
+from scout import obs
 from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
 from scout.config import Settings
 from scout.db import Database
@@ -17,8 +18,6 @@ from scout.parser.gemini import GeminiParser
 from scout.pipeline import Scout
 from scout.sources.apify import ApifySource
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("scout")
 
 
@@ -29,8 +28,12 @@ def build_source(settings: Settings):
 
 
 def main() -> None:
+    obs.setup_logging(None)  # stdout only until DATA_DIR is known
     settings = Settings.from_env()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    obs.setup_logging(settings.data_dir)
+    log.info("Scout starting %s", obs.kv(mode=settings.telegram_mode, data_dir=settings.data_dir,
+                                         model=settings.gemini_model))
     settings.media_dir.mkdir(parents=True, exist_ok=True)
     (settings.data_dir / "started").touch()
 
@@ -42,16 +45,19 @@ def main() -> None:
     scout = Scout(settings, db, build_source(settings), GeminiParser(settings.gemini_api_key, settings.gemini_model), notifier)
     BotHandlers(scout, db, notifier, settings).register(app)
     schedule_jobs(app, scout, settings, db)
+    app.add_error_handler(obs.ErrorReporter(settings.allowed_chat_id))
 
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
             ("upcoming", "Markets you said yes to"),
             ("maybe", "Markets I'm watching for you"),
+            ("events", "All tracked markets, with filters"),
             ("add", "Follow an Instagram account"),
             ("remove", "Stop following an account"),
             ("list", "Accounts I follow"),
             ("check", "Check all accounts now"),
-            ("status", "Last checks and Apify credit"),
+            ("status", "Last checks, counters and Apify credit"),
+            ("logs", "Recent warnings and errors"),
             ("pause", "Mute alerts"),
             ("resume", "Unmute alerts"),
             ("help", "What Scout does"),
