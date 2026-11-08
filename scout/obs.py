@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from telegram import Update
-from telegram.error import NetworkError, TelegramError
+from telegram.error import Conflict, NetworkError, TelegramError
 from telegram.ext import ContextTypes
 
 log = logging.getLogger(__name__)
@@ -279,6 +279,10 @@ class ErrorReporter:
             _trace_id.set(tid)
         name = type(err).__name__ if err else "Unknown"
         where = kv(update_id=getattr(update, "update_id", None), job=getattr(ctx.job, "name", None))
+        if isinstance(err, Conflict) and update is None:
+            # Two pollers for a few seconds while Dokploy swaps containers on deploy.
+            log.warning("Telegram polling conflict %s (another instance was still running)", where)
+            return
         if isinstance(err, NetworkError) and update is None:
             # Polling hiccups: PTB retries on its own; nothing the user can act on.
             log.warning("Telegram network error %s %s: %s", name, where, err)
