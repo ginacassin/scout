@@ -15,6 +15,7 @@ from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
 from scout.config import Settings
 from scout.db import Database
 from scout.gcal import setup_calendar
+from scout.eventbrite import setup_booking_watcher
 from scout.parser.gemini import GeminiParser
 from scout.pipeline import Scout
 from scout.sources.apify import ApifySource
@@ -45,6 +46,7 @@ def main() -> None:
     notifier = TelegramNotifier(app, db, settings.allowed_chat_id, settings.tz)
     scout = Scout(settings, db, build_source(settings), GeminiParser(settings.gemini_api_key, settings.gemini_model), notifier)
     BotHandlers(scout, db, notifier, settings).register(app)
+    setup_booking_watcher(app, settings, db)  # M3: Eventbrite booking pings, /bookings
     schedule_jobs(app, scout, settings, db)
     setup_calendar(app, settings, db)  # M2: no-op unless GCAL_SA_JSON and GCAL_CALENDAR_ID are set
     app.add_error_handler(obs.ErrorReporter(settings.allowed_chat_id))
@@ -52,6 +54,7 @@ def main() -> None:
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
             ("upcoming", "Markets you said yes to"),
+            ("bookings", "Eventbrite openings I'm watching"),
             ("maybe", "Markets I'm watching for you"),
             ("events", "All tracked markets, with filters"),
             ("add", "Follow an Instagram account"),
