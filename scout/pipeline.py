@@ -298,6 +298,56 @@ class Scout:
         return ev_id
 
     # ----------------------------------------------------------------- upkeep
+    def dedupe_events(self) -> int:
+        """Merge open events of one account that are the same market (same dates, near-identical
+        titles, no conflicting address). Keeps the older event, the user's answer, and fills gaps."""
+        from .matching import similarity
+
+        merged = 0
+        with self.db.session() as s:
+            events = list(s.scalars(select(Event).where(Event.status != "past").order_by(Event.id)))
+            gone: set[int] = set()
+            for i, keep in enumerate(events):
+                if keep.id in gone:
+                    continue
+                for dup in events[i + 1:]:
+                    if dup.id in gone or dup.account_id != keep.account_id:
+                        continue
+                    if not (set(keep.date_list) & set(dup.date_list)):
+                        continue
+                    if similarity(keep.title, dup.title) < 0.5:
+                        continue
+                    if keep.address and dup.address and similarity(keep.address, dup.address) < 0.3:
+                        continue
+                    for col in ("address", "area", "booking_url", "booking_opens_at", "booking_scope", "price",
+                                "organizer", "source_url", "media_path", "telegram_message_id", "gcal_event_id"):
+                        if getattr(keep, col) in (None, "") and getattr(dup, col) not in (None, ""):
+                            setattr(keep, col, getattr(dup, col))
+                    if keep.booking_method in ("unknown", "free_entry") and dup.booking_method not in ("unknown", "free_entry"):
+                        keep.booking_method = dup.booking_method
+                    keep.link_in_bio = keep.link_in_bio or dup.link_in_bio
+                    rank = {"yes": 3, "maybe": 2, "no": 1, "pending": 0, "filtered": -1}
+                    if rank.get(dup.user_decision, 0) > rank.get(keep.user_decision, 0):
+                        keep.user_decision = dup.user_decision
+                    keep.status = event_status(keep.date_list, keep.address)
+                    keep.log_change(f"merged duplicate event {dup.id}")
+                    for item in s.scalars(select(SourceItem).where(SourceItem.event_ids.contains(str(dup.id)))):
+                        ids = [keep.id if x == dup.id else x for x in json.loads(item.event_ids or "[]")]
+                        item.event_ids = json.dumps(sorted(set(ids)))
+                    from .db import BookingWatch
+                    for w in s.scalars(select(BookingWatch).where(BookingWatch.event_id == dup.id)):
+                        if s.scalar(select(BookingWatch).where(BookingWatch.event_id == keep.id)):
+                            s.delete(w)
+                        else:
+                            w.event_id = keep.id
+                    dup.status = "past"
+                    dup.user_decision = "filtered"
+                    dup.log_change(f"duplicate of event {keep.id}")
+                    gone.add(dup.id)
+                    merged += 1
+                    log.info("Merged duplicate event %s into %s (%s)", dup.id, keep.id, keep.title)
+        return merged
+
     def mark_past_events(self) -> int:
         today = datetime.now(self.settings.tz).date()
         n = 0

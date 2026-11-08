@@ -69,12 +69,15 @@ def find_match(parsed: ParsedEvent, candidates: Sequence[EventLike], now: dateti
                 # Same venue on new dates is a new event ("segunda vuelta").
                 continue
             score += 2.0
-        # Different places on the same weekend are different markets (roundup posts, clashes).
-        if parsed.address and ev.address and similarity(parsed.address, ev.address) < 0.3:
-            continue
-        if not (parsed.address and ev.address) and parsed.area and ev.area and similarity(parsed.area, ev.area) < 0.3:
-            continue
         title_sim = max(similarity(parsed.title, ev.title), similarity(parsed.address, ev.address))
+        # Different places on the same weekend are different markets (roundup posts, clashes).
+        # Gemini words neighbourhoods inconsistently ("Martínez Villergas" vs "Ciudad Lineal"), so an
+        # area mismatch only separates two events when their titles differ too.
+        if parsed.address and ev.address and similarity(parsed.address, ev.address) < 0.3 and title_sim < 0.5:
+            continue
+        if (not (parsed.address and ev.address) and parsed.area and ev.area
+                and similarity(parsed.area, ev.area) < 0.3 and title_sim < 0.5):
+            continue
         score += title_sim
         if parsed.address and ev.address and similarity(parsed.address, ev.address) >= 0.5:
             score += 1.0

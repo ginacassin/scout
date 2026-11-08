@@ -240,3 +240,40 @@ async def test_seen_items_are_never_processed_twice(world):
     assert len(notifier.new) == 1
     with db.session() as s:
         assert s.query(Event).one().booking_opens_at.astimezone(TZ).hour == 0  # midnight opening kept
+
+
+@pytest.mark.asyncio
+async def test_my_market_bio_then_post_with_different_area_wording_is_one_market(world):
+    scout, db, parser, notifier = world
+    dates = ["2026-11-13", "2026-11-14", "2026-11-15"]
+    bio = post(scout, db, "my_market_mad", "BIO1", at(4), "bio",
+               ParseResult(kind=ItemKind.new_event, events=[ev("Martínez Villergas Market", dates=dates, area="Martínez Villergas")]))
+    y3 = post(scout, db, "my_market_mad", "DfVUfq2O2l0", at(4, 13), "Y3b",
+              ParseResult(kind=ItemKind.new_event, events=[ev("Market Martínez Villergas", dates=dates,
+                                                               address="C/ Caribe 5 y 7, esquina C/ Martínez Villergas",
+                                                               area="Ciudad Lineal", booking=BookingMethod.eventbrite)]))
+    await run(scout, bio, at(4))
+    await run(scout, y3, at(4, 13))
+    assert len(notifier.new) == 1
+    with db.session() as s:
+        e = s.query(Event).one()
+        assert e.address and e.booking_method == "eventbrite"
+
+
+def test_dedupe_merges_existing_duplicates(world):
+    scout, db, parser, notifier = world
+    acc, _ = db.add_account("my_market_mad")
+    with db.session() as s:
+        a = Event(account_id=acc.id, title="Martínez Villergas Market", area="Martínez Villergas", user_decision="pending")
+        a.date_list = [datetime(2026, 11, d).date() for d in (13, 14, 15)]
+        b = Event(account_id=acc.id, title="Market Martínez Villergas", address="C/ Caribe 5 y 7",
+                  booking_method="eventbrite", user_decision="yes")
+        b.date_list = [datetime(2026, 11, d).date() for d in (13, 14, 15)]
+        c = Event(account_id=acc.id, title="Vecinal Coslada", area="Coslada")
+        c.date_list = [datetime(2026, 11, 13).date()]
+        s.add_all([a, b, c])
+    assert scout.dedupe_events() == 1
+    with db.session() as s:
+        keep = s.get(Event, 1)
+        assert keep.address == "C/ Caribe 5 y 7" and keep.user_decision == "yes" and keep.booking_method == "eventbrite"
+        assert s.get(Event, 2).status == "past" and s.get(Event, 3).status != "past"
