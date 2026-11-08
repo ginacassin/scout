@@ -575,10 +575,18 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
     tz = settings.tz
 
     async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        async with obs.trace("poll_profiles", swallow=True, job=ctx.job.name if ctx.job else None):
-            counts = await scout.poll_profiles()
-            log.info("Profile poll done: %s", counts)
-            await _check_budget(scout, db, settings, app)
+        up = app.bot_data.get("uptime")
+        try:
+            async with obs.trace("poll_profiles", job=ctx.job.name if ctx.job else None):
+                counts = await scout.poll_profiles()
+                log.info("Profile poll done: %s", counts)
+                await _check_budget(scout, db, settings, app)
+        except Exception as exc:  # noqa: BLE001 - logged by trace; reported after repeated failures
+            if up:
+                await up.poll_result(False, f"{type(exc).__name__}: {exc}")
+            return
+        if up:
+            await up.poll_result(True)
 
     async def stories_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         async with obs.trace("poll_stories", swallow=True):

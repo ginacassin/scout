@@ -16,6 +16,7 @@ from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
 from scout.config import Settings
 from scout.db import Database
 from scout.gcal import setup_calendar
+from scout.uptime import setup_uptime
 from scout.eventbrite import setup_booking_watcher
 from scout.parser.gemini import GeminiParser
 from scout.pipeline import Scout
@@ -52,6 +53,7 @@ def main() -> None:
     setup_calendar(app, settings, db)  # M2: no-op unless GCAL_SA_JSON and GCAL_CALENDAR_ID are set
     app.add_error_handler(obs.ErrorReporter(settings.allowed_chat_id))
     setup_autobook(app, settings, db)
+    setup_uptime(app, settings, db)  # tells you only when Scout was down or checks keep failing
 
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
@@ -70,12 +72,8 @@ def main() -> None:
             ("resume", "Unmute alerts"),
             ("help", "What Scout does"),
         ])
-        n = len(db.active_accounts())
-        try:
-            await application.bot.send_message(settings.allowed_chat_id, f"🟢 Scout is up — following {n} accounts.")
-        except TelegramError as exc:
-            # Telegram refuses until the user has pressed Start in the bot's chat.
-            log.warning("Can't message chat %s yet (%s). Open the bot and press Start.", settings.allowed_chat_id, exc)
+        # No "I'm up" message: you only hear about outages (scout/uptime.py).
+        log.info("Scout up, following %d accounts", len(db.active_accounts()))
 
     app.post_init = on_start
 

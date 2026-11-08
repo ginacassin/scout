@@ -41,7 +41,7 @@ class Settings:
     apify_budget_usd: float = 5.0
     region_filter: str = "madrid"
     seed_accounts: list[str] = field(default_factory=lambda: list(DEFAULT_ACCOUNTS))
-    telegram_mode: str = "polling"  # polling | webhook
+    telegram_mode: str = "webhook"  # webhook | polling
 
     @property
     def webhook_path(self) -> str:
@@ -85,5 +85,5 @@ class Settings:
             apify_budget_usd=float(env.get("APIFY_MONTHLY_BUDGET_USD", "5")),
             region_filter=env.get("REGION_FILTER", "madrid"),
             seed_accounts=_list(env.get("SEED_ACCOUNTS")) or list(DEFAULT_ACCOUNTS),
-            telegram_mode=env.get("TELEGRAM_MODE", "polling"),
+            telegram_mode=env.get("TELEGRAM_MODE", "webhook"),
         )
