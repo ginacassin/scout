@@ -15,7 +15,9 @@ from sqlalchemy import select
 from . import hooks
 from .config import Settings
 from .db import Account, Database, Event, SourceItem, utcnow
-from .matching import MergeOutcome, event_status, find_match, parse_dates
+from .dedupe import GeminiTieBreaker, Matcher, latest_caption, merge_events, post_key, upgrade_address
+from .matching import (DIFFERENT, MAYBE, MergeOutcome, address_specificity, compare, event_status,
+                       facts_from_event, facts_from_parsed, parse_dates)
 from .media import download_images
 from .obs import kv
 from .parser.schema import ItemKind, ParsedEvent, ParseResult, Region
@@ -61,12 +63,15 @@ def bio_ig_id(handle: str, bio: str, links: list[str]) -> str:
 
 
 class Scout:
-    def __init__(self, settings: Settings, db: Database, source: InstagramSource, parser: Parser, notifier: Notifier):
+    def __init__(self, settings: Settings, db: Database, source: InstagramSource, parser: Parser, notifier: Notifier,
+                 tiebreaker=None):  # noqa: ANN001
         self.settings = settings
         self.db = db
         self.source = source
         self.parser = parser
         self.notifier = notifier
+        # Duplicate detection: rules first, Gemini only for inconclusive pairs (same client/model as the parser).
+        self.matcher = Matcher(db, tiebreaker if tiebreaker is not None else GeminiTieBreaker.from_parser(parser))
 
     # ------------------------------------------------------------------ polling
     async def poll_profiles(self, handles: list[str] | None = None) -> dict[str, int]:
@@ -242,22 +247,48 @@ class Scout:
                                events=len(result.events), event_ids=",".join(map(str, event_ids)) or None))
         return 1
 
-    def _candidates(self, s, c: Candidate, parsed: ParsedEvent) -> list[Event]:  # noqa: ANN001
+    def _candidates(self, s, c: Candidate, parsed: ParsedEvent) -> tuple[list[Event], set[str], dict[int, str]]:  # noqa: ANN001
+        """Open events of the same account, a collab partner or the named organizer; the brand handles
+        of that group; and account_id -> handle."""
         handles = {c.account.handle, *(c.coauthors or [])}
         if parsed.organizer:
             handles.add(parsed.organizer.lstrip("@").lower())
         acc_ids = list(s.scalars(select(Account.id).where(Account.handle.in_(handles))))
         q = select(Event).where(Event.status != "past")
         events = list(s.scalars(q))
-        return [e for e in events if e.account_id in acc_ids or (e.organizer and e.organizer.lower() in handles)]
+        cands = [e for e in events if e.account_id in acc_ids or (e.organizer and e.organizer.lower() in handles)]
+        names = {a.id: a.handle for a in s.scalars(select(Account).where(Account.id.in_({e.account_id for e in cands})))}
+        brands = handles | {e.organizer for e in cands if e.organizer} | set(names.values())
+        return cands, brands, names
 
     async def handle_event(self, c: Candidate, parsed: ParsedEvent, kind: ItemKind, images: list[Path], now: datetime) -> int | None:
         today = now.astimezone(self.settings.tz).date()
         pdates = parse_dates(parsed.dates)
         with self.db.session() as s:
-            match = find_match(parsed, self._candidates(s, c, parsed), now)
+            cands, brands, names = self._candidates(s, c, parsed)
+        new = facts_from_parsed(parsed, brands, account=c.account.handle, now=now)
+        cand_facts = {e.id: facts_from_event(e, brands, account=names.get(e.account_id)) for e in cands}
+        found = await self.matcher.resolve(new, [(cand_facts[e.id], e) for e in cands], now,
+                                           key=post_key(c.ig_id, parsed.title), caption=c.caption)
+        match = min((r.event for r in found), key=lambda e: (e.created_at, e.id)) if found else None
+        if match is not None:
+            # Only fold in other matches that are not themselves clearly a different market from the target.
+            found = [r for r in found if r.event.id == match.id or compare(
+                cand_facts[r.event.id], cand_facts[match.id], r.event.created_at or now).verdict != DIFFERENT]
+        if found:
+            log.info("match %s", kv(ig_id=c.ig_id, title=parsed.title[:60], event_id=match.id,
+                                    via=",".join(f"{r.event.id}:{r.via}" for r in found)))
+        merged: list[int] = []
+        with self.db.session() as s:
             if match is not None:
                 ev = s.get(Event, match.id)
+                # The post ties together events Scout stored separately: fold them into the oldest.
+                for r in found:
+                    if r.event.id != ev.id:
+                        dup = s.get(Event, r.event.id)
+                        if dup is not None and dup.status != "past":
+                            merge_events(s, ev, dup)
+                            merged.append(dup.id)
                 outcome = merge_into(ev, parsed, kind, self.settings.tz)
                 if c.url and not ev.source_url:
                     ev.source_url = c.url
@@ -283,6 +314,8 @@ class Scout:
                 notify = not filtered
                 outcome = None
 
+        for dup_id in merged:
+            await hooks.emit("events_merged", ev_id, merged_id=dup_id)
         alert = bool(notify and (match is None or outcome))
         log.info("event %s", kv(ig_id=c.ig_id, action="created" if match is None else "matched", event_id=ev_id,
                                 decision=ev_snapshot.user_decision, changes="; ".join(outcome.changes) if outcome and
@@ -298,55 +331,51 @@ class Scout:
         return ev_id
 
     # ----------------------------------------------------------------- upkeep
-    def dedupe_events(self) -> int:
-        """Merge open events of one account that are the same market (same dates, near-identical
-        titles, no conflicting address). Keeps the older event, the user's answer, and fills gaps."""
-        from .matching import similarity
-
-        merged = 0
+    async def dedupe_events(self) -> int:
+        """Merge open events that are the same market, with the same rules as live matching plus the
+        Gemini tie-breaker for inconclusive pairs. The oldest event is kept; each merge emits
+        "events_merged" so the calendar/booking modules can drop the duplicate's entries."""
+        now = utcnow()
         with self.db.session() as s:
-            events = list(s.scalars(select(Event).where(Event.status != "past").order_by(Event.id)))
-            gone: set[int] = set()
-            for i, keep in enumerate(events):
-                if keep.id in gone:
+            events = list(s.scalars(select(Event).where(Event.status != "past").order_by(Event.created_at, Event.id)))
+            names = {a.id: a.handle for a in s.scalars(select(Account))}
+
+        def group(e: Event) -> set[str]:
+            return {h for h in (names.get(e.account_id), (e.organizer or "").lower()) if h}
+
+        gone: set[int] = set()
+        pairs: list[tuple[int, int]] = []
+        for i in range(len(events)):
+            keep = events[i]
+            if keep.id in gone:
+                continue
+            for dup in events[i + 1:]:
+                if dup.id in gone or not (dup.account_id == keep.account_id or group(dup) & group(keep)):
                     continue
-                for dup in events[i + 1:]:
-                    if dup.id in gone or dup.account_id != keep.account_id:
-                        continue
-                    if not (set(keep.date_list) & set(dup.date_list)):
-                        continue
-                    if similarity(keep.title, dup.title) < 0.5:
-                        continue
-                    if keep.address and dup.address and similarity(keep.address, dup.address) < 0.3:
-                        continue
-                    for col in ("address", "area", "booking_url", "booking_opens_at", "booking_scope", "price",
-                                "organizer", "source_url", "media_path", "telegram_message_id", "gcal_event_id"):
-                        if getattr(keep, col) in (None, "") and getattr(dup, col) not in (None, ""):
-                            setattr(keep, col, getattr(dup, col))
-                    if keep.booking_method in ("unknown", "free_entry") and dup.booking_method not in ("unknown", "free_entry"):
-                        keep.booking_method = dup.booking_method
-                    keep.link_in_bio = keep.link_in_bio or dup.link_in_bio
-                    rank = {"yes": 3, "maybe": 2, "no": 1, "pending": 0, "filtered": -1}
-                    if rank.get(dup.user_decision, 0) > rank.get(keep.user_decision, 0):
-                        keep.user_decision = dup.user_decision
-                    keep.status = event_status(keep.date_list, keep.address)
-                    keep.log_change(f"merged duplicate event {dup.id}")
-                    for item in s.scalars(select(SourceItem).where(SourceItem.event_ids.contains(str(dup.id)))):
-                        ids = [keep.id if x == dup.id else x for x in json.loads(item.event_ids or "[]")]
-                        item.event_ids = json.dumps(sorted(set(ids)))
-                    from .db import BookingWatch
-                    for w in s.scalars(select(BookingWatch).where(BookingWatch.event_id == dup.id)):
-                        if s.scalar(select(BookingWatch).where(BookingWatch.event_id == keep.id)):
-                            s.delete(w)
-                        else:
-                            w.event_id = keep.id
-                    dup.status = "past"
-                    dup.user_decision = "filtered"
-                    dup.log_change(f"duplicate of event {keep.id}")
-                    gone.add(dup.id)
-                    merged += 1
-                    log.info("Merged duplicate event %s into %s (%s)", dup.id, keep.id, keep.title)
-        return merged
+                brands = group(keep) | group(dup)
+                kf = facts_from_event(keep, brands, account=names.get(keep.account_id))
+                df = facts_from_event(dup, brands, account=names.get(dup.account_id))
+                cmp = compare(df, kf, dup.created_at or now)
+                if cmp.verdict == DIFFERENT:
+                    continue
+                caption = None
+                if cmp.verdict == MAYBE:
+                    with self.db.session() as s:
+                        caption = latest_caption(s, dup.id)
+                same, via = await self.matcher.decide(cmp, kf, df, keep.id, f"ev:{dup.id}", caption)
+                log.info("dedupe pair %s", kv(keep=keep.id, dup=dup.id, verdict=cmp.verdict, score=round(cmp.score, 2),
+                                              same=same, via=via))
+                if not same:
+                    continue
+                with self.db.session() as s:
+                    merge_events(s, s.get(Event, keep.id), s.get(Event, dup.id))
+                with self.db.session() as s:
+                    keep = events[i] = s.get(Event, keep.id)  # refreshed (address/dates may have grown)
+                gone.add(dup.id)
+                pairs.append((keep.id, dup.id))
+        for keep_id, dup_id in pairs:
+            await hooks.emit("events_merged", keep_id, merged_id=dup_id)
+        return len(pairs)
 
     def mark_past_events(self) -> int:
         today = datetime.now(self.settings.tz).date()
@@ -410,9 +439,17 @@ def merge_into(ev: Event, parsed: ParsedEvent, kind: ItemKind, tz) -> MergeOutco
     elif new_dates and set(new_dates) - set(ev.date_list) and kind == ItemKind.update:
         ev.date_list = sorted(set(ev.date_list) | set(new_dates))
         out.changes.append("dates extended")
-    if parsed.address and not ev.address:
-        ev.address = parsed.address
-        out.changes.append(f"address: {parsed.address}")
+    if parsed.address:
+        before = ev.address
+        addr, changed = upgrade_address(ev.address, parsed.address)
+        if changed:
+            ev.address = addr
+            old_spec, new_spec = address_specificity(before), address_specificity(addr)
+            if old_spec < 2:
+                out.changes.append(f"address: {addr}")
+            elif new_spec > old_spec:
+                out.changes.append(f"exact address: {addr}")  # street known before, door number now
+            # same detail, fuller wording: stored silently
     if parsed.area and not ev.area:
         ev.area = parsed.area
     if parsed.sessions and parsed.sessions != [] and json_sessions(parsed) != ev.sessions:

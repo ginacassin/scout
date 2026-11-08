@@ -272,7 +272,8 @@ def test_dedupe_merges_existing_duplicates(world):
         c = Event(account_id=acc.id, title="Vecinal Coslada", area="Coslada")
         c.date_list = [datetime(2026, 11, 13).date()]
         s.add_all([a, b, c])
-    assert scout.dedupe_events() == 1
+    import asyncio
+    assert asyncio.run(scout.dedupe_events()) == 1
     with db.session() as s:
         keep = s.get(Event, 1)
         assert keep.address == "C/ Caribe 5 y 7" and keep.user_decision == "yes" and keep.booking_method == "eventbrite"
