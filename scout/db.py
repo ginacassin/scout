@@ -143,6 +143,26 @@ class Event(Base):
         self.change_log = json.dumps(log, ensure_ascii=False)
 
 
+class BookingWatch(Base):
+    """Eventbrite tracking for one event (M3) and the auto-book request (M4)."""
+
+    __tablename__ = "booking_watches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), unique=True, index=True)
+    eventbrite_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    event_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    opens_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    state: Mapped[str] = mapped_column(String(16), default="resolving")  # resolving | waiting | live | sold_out | done | error
+    is_free: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    pings_sent: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of ping keys already sent
+    reminders_on: Mapped[bool] = mapped_column(Boolean, default=True)
+    autobook: Mapped[bool] = mapped_column(Boolean, default=False)
+    autobook_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class Setting(Base):
     __tablename__ = "settings"
 

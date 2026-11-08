@@ -12,6 +12,7 @@ from typing import Protocol
 
 from sqlalchemy import select
 
+from . import hooks
 from .config import Settings
 from .db import Account, Database, Event, SourceItem, utcnow
 from .matching import MergeOutcome, event_status, find_match, parse_dates
@@ -271,6 +272,10 @@ class Scout:
             await self.notifier.new_event(ev_snapshot, kind.value)
         elif match is not None and notify and outcome:
             await self.notifier.event_update(ev_snapshot, outcome.changes)
+        if match is None:
+            await hooks.emit("event_created", ev_id, kind=kind.value)
+        elif outcome and outcome.significant:
+            await hooks.emit("event_updated", ev_id, changes=outcome.changes)
         return ev_id
 
     # ----------------------------------------------------------------- upkeep

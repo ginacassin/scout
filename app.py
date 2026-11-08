@@ -65,17 +65,23 @@ def main() -> None:
 
     app.post_init = on_start
 
-    secret = hashlib.sha256(settings.bot_token.encode()).hexdigest()[:32]
-    log.info("Starting webhook on :%d/%s", settings.port, settings.webhook_path)
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=settings.port,
-        url_path=settings.webhook_path,
-        webhook_url=settings.webhook_url,
-        secret_token=secret,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    if settings.telegram_mode == "webhook":
+        secret = hashlib.sha256(settings.bot_token.encode()).hexdigest()[:32]
+        log.info("Starting webhook on :%d/%s", settings.port, settings.webhook_path)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=settings.port,
+            url_path=settings.webhook_path,
+            webhook_url=settings.webhook_url,
+            secret_token=secret,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    else:
+        # Long polling: the bot fetches its own updates, so no public domain or certificate is needed.
+        # run_polling deletes any webhook Telegram still has registered.
+        log.info("Starting long polling")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":

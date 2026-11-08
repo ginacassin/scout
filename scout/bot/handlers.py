@@ -21,6 +21,7 @@ from telegram.ext import (
     filters,
 )
 
+from .. import hooks
 from ..db import Account, Database, Event
 from ..media import prune_media
 from . import templates as T
@@ -361,8 +362,10 @@ class BotHandlers:
             if not ev:
                 await q.answer("That market is no longer tracked.")
                 return
+            old = ev.user_decision
             ev.user_decision = decision
             handle = s.get(Account, ev.account_id).handle
+        await hooks.emit("decision_changed", ev_id, old=old, new=decision)
         toast = {"yes": "Marked as going", "maybe": "I'll tell you when it's confirmed", "no": "Skipped"}[decision]
         await q.answer(toast)
         caption = T.event_caption(ev, handle, self.settings.tz)

@@ -41,6 +41,7 @@ class Settings:
     apify_budget_usd: float = 5.0
     region_filter: str = "madrid"
     seed_accounts: list[str] = field(default_factory=lambda: list(DEFAULT_ACCOUNTS))
+    telegram_mode: str = "polling"  # polling | webhook
 
     @property
     def webhook_path(self) -> str:
@@ -62,13 +63,13 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         env = os.environ
-        missing = [k for k in ("BOT_TOKEN", "WEBHOOK_URL", "TELEGRAM_ALLOWED_CHAT_ID", "GEMINI_API_KEY", "APIFY_TOKEN") if not env.get(k)]
+        missing = [k for k in ("BOT_TOKEN", "TELEGRAM_ALLOWED_CHAT_ID", "GEMINI_API_KEY", "APIFY_TOKEN") if not env.get(k)]
         if missing:
             raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
         hours = [int(h) for h in _list(env.get("POLL_HOURS"))] or [8, 11, 14, 17, 20, 23]
         return cls(
             bot_token=env["BOT_TOKEN"],
-            webhook_url=env["WEBHOOK_URL"],
+            webhook_url=env.get("WEBHOOK_URL", ""),
             port=int(env.get("PORT", "8000")),
             allowed_chat_id=int(env["TELEGRAM_ALLOWED_CHAT_ID"]),
             gemini_api_key=env["GEMINI_API_KEY"],
@@ -84,4 +85,5 @@ class Settings:
             apify_budget_usd=float(env.get("APIFY_MONTHLY_BUDGET_USD", "5")),
             region_filter=env.get("REGION_FILTER", "madrid"),
             seed_accounts=_list(env.get("SEED_ACCOUNTS")) or list(DEFAULT_ACCOUNTS),
+            telegram_mode=env.get("TELEGRAM_MODE", "polling"),
         )
