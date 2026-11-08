@@ -117,6 +117,13 @@ class Event(Base):
     telegram_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gcal_event_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     change_log: Mapped[str] = mapped_column(Text, default="[]")
+    # Your own notes ("get the green lamp in the living room"), JSON list of {"at": iso, "text": str}
+    notes: Mapped[str] = mapped_column(Text, default="[]")
+    # A confirmed booking slot (from the auto-booker or entered with /booked)
+    booked_start: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    booked_end: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    booked_via: Mapped[str | None] = mapped_column(String(16), nullable=True)  # auto | manual
+    ticket_path: Mapped[str | None] = mapped_column(String(500), nullable=True)  # QR image or ticket PDF on /data
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow, onupdate=utcnow)
 
@@ -136,6 +143,20 @@ class Event(Base):
     @session_list.setter
     def session_list(self, values: list[dict[str, Any]]) -> None:
         self.sessions = json.dumps(values, ensure_ascii=False)
+
+    @property
+    def note_list(self) -> list[dict[str, Any]]:
+        return json.loads(self.notes or "[]")
+
+    def add_note(self, text: str) -> None:
+        notes = self.note_list
+        notes.append({"at": utcnow().isoformat(), "text": text})
+        self.notes = json.dumps(notes, ensure_ascii=False)
+
+    @property
+    def end_date(self) -> date | None:
+        ds = self.date_list
+        return max(ds) if ds else None
 
     def log_change(self, what: str) -> None:
         log = json.loads(self.change_log or "[]")
@@ -183,7 +204,28 @@ class Database:
             cur.close()
 
         Base.metadata.create_all(self.engine)
+        self._add_missing_columns()
         self._session = sessionmaker(self.engine, expire_on_commit=False)
+
+    def _add_missing_columns(self) -> None:
+        """create_all() never alters existing tables: add new nullable/defaulted columns by hand."""
+        from sqlalchemy import inspect, text
+
+        insp = inspect(self.engine)
+        with self.engine.begin() as conn:
+            for table in Base.metadata.sorted_tables:
+                if not insp.has_table(table.name):
+                    continue
+                have = {c["name"] for c in insp.get_columns(table.name)}
+                for col in table.columns:
+                    if col.name in have:
+                        continue
+                    ddl = col.type.compile(dialect=self.engine.dialect)
+                    default = ""
+                    if col.default is not None and getattr(col.default, "is_scalar", False):
+                        v = col.default.arg
+                        default = f" DEFAULT {int(v) if isinstance(v, bool) else repr(v)}"
+                    conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN "{col.name}" {ddl}{default}'))
 
     @contextmanager
     def session(self) -> Iterator[Session]:

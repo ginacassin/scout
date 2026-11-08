@@ -5,6 +5,10 @@ Signals (all handlers are `async def fn(event_id: int, **kw)`):
 - "decision_changed": kw = old: str, new: str            (user tapped a button)
 - "event_created":    kw = kind: str                       (new event stored, alerted or not)
 - "event_updated":    kw = changes: list[str]              (merge changed something)
+- "booking_confirmed": kw = via: str ("auto"|"manual")    (Event.booked_start/booked_end/ticket_path set)
+- "ticket_added":     kw = path: str                       (QR/ticket file stored for an already booked event)
+- "note_added":       kw = text: str
+- "events_merged":    kw = merged_id: int                  (event_id kept, merged_id folded into it)
 
 Handlers run sequentially; one failing handler is logged and never breaks the others or the caller.
 """
@@ -20,7 +24,8 @@ log = logging.getLogger(__name__)
 Handler = Callable[..., Awaitable[None]]
 _handlers: dict[str, list[Handler]] = defaultdict(list)
 
-SIGNALS = {"decision_changed", "event_created", "event_updated"}
+SIGNALS = {"decision_changed", "event_created", "event_updated", "booking_confirmed", "ticket_added",
+           "note_added", "events_merged"}
 
 
 def on(signal: str, fn: Handler) -> None:
