@@ -18,7 +18,8 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements.txt
+# --ignore-installed: the base image has a Debian-managed typing_extensions that pip cannot uninstall
+RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-installed -r requirements.txt
 
 COPY scoutbooker ./scoutbooker
 COPY entrypoint.sh .
