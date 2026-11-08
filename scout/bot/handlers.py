@@ -149,7 +149,8 @@ class BotHandlers:
         }
         for name, fn in cmds.items():
             app.add_handler(CommandHandler(name, fn, filters=only_me))
-        app.add_handler(CallbackQueryHandler(self.on_callback))
+        # Core prefixes only; feature modules own their own (eb:, ab:, cal:) with their own handlers.
+        app.add_handler(CallbackQueryHandler(self.on_callback, pattern=r"^(d|c|r|rc|rx|f):|^x$|^rx$"))
         app.add_handler(MessageHandler(only_me & filters.TEXT & ~filters.COMMAND, self.on_text))
 
     def _allowed(self, update: Update) -> bool:

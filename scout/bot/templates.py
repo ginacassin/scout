@@ -108,6 +108,11 @@ def event_caption(ev: Event, handle: str, tz: ZoneInfo, header: str | None = Non
     return text
 
 
+# Feature modules (eventbrite watcher, auto-booker) append functions here that return extra
+# buttons for an answered card, e.g. "🔔 Reminders on" or "🤖 Auto-book at opening".
+EXTRA_ANSWERED_BUTTONS: list = []  # list[Callable[[Event], list[InlineKeyboardButton]]]
+
+
 def _link_row(ev: Event) -> list[InlineKeyboardButton]:
     row = []
     if ev.source_url:
@@ -134,6 +139,10 @@ def decision_keyboard(ev: Event, teaser: bool = False) -> InlineKeyboardMarkup:
 
 def answered_keyboard(ev: Event) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("↩️ Change answer", callback_data=f"c:{ev.id}")]]
+    for fn in EXTRA_ANSWERED_BUTTONS:
+        extra = fn(ev)
+        if extra:
+            rows.append(extra)
     links = _link_row(ev)
     if links:
         rows.append(links)
