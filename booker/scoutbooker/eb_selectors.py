@@ -15,7 +15,10 @@ from urllib.parse import urlparse
 RESERVE_RE = re.compile(
     r"^\s*(?:reserve(?: a spot| now| your spot)?|get tickets|register|"
     r"reservar(?: un sitio| una plaza| plaza| ahora)?|conseguir entradas|consigue entradas|"
-    r"obtener entradas|registrarse|reg[ií]strate|apuntarse|ap[uú]ntate)\s*$",
+    r"obtener entradas|registrarse|reg[ií]strate|apuntarse|ap[uú]ntate|"
+    # timed-entry / multi-date events open the checkout (with a date/time picker) from these
+    r"check availability|comprobar disponibilidad|ver disponibilidad|select (?:a )?date(?: and time)?|"
+    r"seleccionar fecha(?: y hora)?|selecciona (?:una )?fecha|ver fechas|see dates)\s*$",
     re.I,
 )
 
@@ -176,6 +179,34 @@ def login_state(url: str | None, text: str | None) -> bool | None:
     return None
 
 
+# -- timed-entry slots (ticket classes like "Viernes 13 · 10:00–10:30" or a date/time picker) ----
+# A time-slot control: a short clickable label containing a time ("10:00", "10:00 - 10:30", "10am").
+SLOT_TIME_JS = r"(^|[^\d:/.])\d{1,2}([:.]\d{2}|\s*[ap]\.?\s?m\b|h\b)"
+# Roles we look at for picker slots. On the event page we skip labels/links (organiser's other events).
+SLOT_PICK_SELECTOR_EVENT_PAGE = "button, [role=button], [role=radio], [role=option], [role=gridcell]"
+SLOT_PICK_SELECTOR_CHECKOUT = ("button, [role=button], [role=radio], [role=option], [role=gridcell], [role=tab], "
+                               "label, [data-testid*=time i], [data-testid*=slot i]")
+# Containers whose plain day-number cells ("13") are calendar days.
+CALENDAR_SELECTOR = "[role=grid], table, [class*=calendar i], [class*=Calendar], [data-testid*=calendar i]"
+
+# -- after booking: where the ticket QR / PDF is ----------------------------------------------
+TICKET_QR_SELECTORS = (
+    "img[alt*='QR' i]", "img[src*='qr' i]", "canvas[aria-label*='QR' i]", "svg[aria-label*='QR' i]",
+    "[data-testid*='qr' i] img", "[data-testid*='qr' i] canvas", "[data-testid*='qr' i] svg",
+    "[class*='qr' i] img", "[class*='qr' i] canvas", "[class*='qr' i] svg", "[data-testid*='qr' i]",
+    "[data-testid*='ticket' i] img[src*='barcode' i]", "img[alt*='código' i]", "img[alt*='barcode' i]",
+)
+MY_TICKETS_RE = re.compile(
+    r"^\s*(?:ver (?:mis |las |tus )?entradas|mis entradas|ir a mis entradas|my tickets|go to my tickets|"
+    r"view (?:my |your )?tickets?|ver (?:el |tu |mi )?pedido|view (?:your |my )?order|ver entrada)\s*$",
+    re.I,
+)
+DOWNLOAD_TICKET_RE = re.compile(
+    r"(?:descargar|download|imprimir|print)\s+(?:las |tus |mis |your |my |the )?(?:entradas?|tickets?|pdf)|"
+    r"descargar pdf|download pdf",
+    re.I,
+)
+
 REASONS = {
     "captcha": "a captcha appeared",
     "paid": "the order isn't free",
@@ -184,6 +215,7 @@ REASONS = {
     "never_opened": "tickets didn't become available in time",
     "sold_out": "it sold out",
     "several_tickets": "there are several ticket types to choose from",
+    "no_slot_fits": "no slot fits your route",
     "quantity": "couldn't pick the ticket quantity",
     "extra_fields": "the form asks for extra details",
     "unexpected_page": "the page looked different than expected",

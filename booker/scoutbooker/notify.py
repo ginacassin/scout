@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 
 from . import eb_selectors as S
-from .jobs import Job
+from .jobs import Job, parse_iso
 
 log = logging.getLogger(__name__)
 
@@ -79,8 +79,24 @@ class Telegram:
             text += "\n⚠️ The Eventbrite session has expired. Send /autobook login before then."
         await self.send(text)
 
+    def slot_text(self, job: Job) -> str:
+        if not job.slot_start:
+            return ""
+        try:
+            start = parse_iso(job.slot_start).astimezone(self.tz)
+            out = start.strftime("%a %-d %b %H:%M")
+            if job.slot_end:
+                out += "–" + parse_iso(job.slot_end).astimezone(self.tz).strftime("%H:%M")
+            return out
+        except ValueError:
+            return job.slot_label
+
     async def booked(self, job: Job, screenshot: Path | None) -> None:
-        text = f"✅ Booked! <b>{escape(job.title)}</b>\nCheck your email for the tickets."
+        text = f"✅ Booked! <b>{escape(job.title)}</b>"
+        if slot := self.slot_text(job):
+            text += f"\n🕙 Slot: <b>{escape(slot)}</b>"
+        text += ("\n🎟 Ticket QR saved — Scout will add it to your calendar." if job.ticket
+                 else "\nCheck your email for the tickets.")
         if screenshot and Path(screenshot).exists():
             await self.photo(screenshot, text)
         else:
@@ -90,7 +106,7 @@ class Telegram:
         text = (f"⚠️ Couldn't auto-book <b>{escape(job.title)}</b> ({escape(S.reason_text(code))}) — "
                 f"<b>book manually NOW</b>")
         if detail:
-            text += f"\n<i>{escape(detail[:200])}</i>"
+            text += f"\n<i>{escape(detail[:500])}</i>"
         if maybe_done:
             text += "\nIt got as far as submitting the order: check your email / My tickets before booking again."
         await self.send(text, self.manual_buttons(job))

@@ -16,6 +16,7 @@ from scout.bot.handlers import BotHandlers, TelegramNotifier, schedule_jobs
 from scout.config import Settings
 from scout.db import Database
 from scout.gcal import setup_calendar
+from scout.planner import setup_planner
 from scout.uptime import setup_uptime
 from scout.eventbrite import setup_booking_watcher
 from scout.parser.gemini import GeminiParser
@@ -52,7 +53,7 @@ def main() -> None:
     schedule_jobs(app, scout, settings, db)
     setup_calendar(app, settings, db)  # M2: no-op unless GCAL_SA_JSON and GCAL_CALENDAR_ID are set
     app.add_error_handler(obs.ErrorReporter(settings.allowed_chat_id))
-    setup_autobook(app, settings, db)
+    setup_planner(app, settings, db, setup_autobook(app, settings, db))  # /plan; route-aware slot choice
     setup_uptime(app, settings, db)  # tells you only when Scout was down or checks keep failing
 
     async def on_start(application: Application) -> None:
@@ -68,6 +69,7 @@ def main() -> None:
             ("status", "Last checks, counters and Apify credit"),
             ("logs", "Recent warnings and errors"),
             ("autobook", "Auto-book free Eventbrite tickets"),
+            ("plan", "Your market route for a day"),
             ("pause", "Mute alerts"),
             ("resume", "Unmute alerts"),
             ("help", "What Scout does"),

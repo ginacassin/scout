@@ -47,6 +47,11 @@ class Job:
     state: str = "scheduled"
     attempts: int = 0
     detail: str = ""
+    constraints: dict | None = None   # from Scout's planner, see slots.py
+    slot_start: str = ""              # chosen timed slot, ISO with Europe/Madrid offset
+    slot_end: str = ""
+    slot_label: str = ""
+    ticket: str = ""                  # file name under /profile/tickets (QR png or ticket pdf)
     created_at: str = field(default_factory=lambda: utcnow().isoformat())
     updated_at: str = field(default_factory=lambda: utcnow().isoformat())
 
@@ -109,8 +114,9 @@ class JobStore:
         job.updated_at = self.clock().isoformat()
 
     def arm(self, event_id: int, eventbrite_id: str, event_url: str, opens_at: datetime, title: str,
-            quantity: int) -> tuple[Job, bool]:
-        """Create or update a job. Returns (job, changed); `changed` is False for an identical re-post.
+            quantity: int, constraints: dict | None = None) -> tuple[Job, bool]:
+        """Create or update a job. Returns (job, changed); `changed` is False for an identical re-post
+        (new constraints count as a change).
 
         Raises JobLocked if the job has already been attempted."""
         opens_iso = opens_at.astimezone(timezone.utc).isoformat()
@@ -118,15 +124,15 @@ class JobStore:
         if job and job.attempts > 0:
             raise JobLocked(job)
         if job and job.state == "scheduled":
-            changed = (job.opens_at, job.eventbrite_id, job.event_url, job.quantity) != (
-                opens_iso, eventbrite_id, event_url, quantity)
-            job.eventbrite_id, job.event_url, job.opens_at, job.title, job.quantity = (
-                eventbrite_id, event_url, opens_iso, title, quantity)
+            changed = (job.opens_at, job.eventbrite_id, job.event_url, job.quantity, job.constraints) != (
+                opens_iso, eventbrite_id, event_url, quantity, constraints)
+            job.eventbrite_id, job.event_url, job.opens_at, job.title, job.quantity, job.constraints = (
+                eventbrite_id, event_url, opens_iso, title, quantity, constraints)
             self._touch(job)
             self.save()
             return job, changed
         job = Job(event_id=int(event_id), eventbrite_id=eventbrite_id, event_url=event_url, opens_at=opens_iso,
-                  title=title, quantity=quantity)
+                  title=title, quantity=quantity, constraints=constraints)
         self.jobs[job.event_id] = job
         self.save()
         return job, True
@@ -158,6 +164,20 @@ class JobStore:
         if job is None or job.state == "cancelled":
             return job
         self._touch(job, state, detail)
+        self.save()
+        return job
+
+    def set_result(self, event_id: int, slot_start: str = "", slot_end: str = "", slot_label: str = "",
+                   ticket: str = "") -> Job | None:
+        """Remember the chosen slot and the captured ticket file (kept even if the state changes later)."""
+        job = self.jobs.get(int(event_id))
+        if job is None:
+            return None
+        if slot_start:
+            job.slot_start, job.slot_end, job.slot_label = slot_start, slot_end, slot_label
+        if ticket:
+            job.ticket = ticket
+        self._touch(job)
         self.save()
         return job
 
