@@ -34,7 +34,8 @@ from . import templates as T
 
 log = logging.getLogger(__name__)
 
-PENDING_TTL = {"note": timedelta(minutes=15), "time": timedelta(minutes=15), "ticket": timedelta(minutes=30)}
+PENDING_TTL = {"note": timedelta(minutes=15), "time": timedelta(minutes=15), "ticket": timedelta(minutes=30),
+               "file": timedelta(minutes=30)}
 REMINDER_AT = time(8, 30)
 REMINDER_BEFORE_SLOT = timedelta(hours=1)
 SENT_KEY = "note_reminders_sent"
@@ -44,6 +45,7 @@ TIME_RE = re.compile(r"^(\d{1,2})(?:[:.h](\d{2}))?$")
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
             "lun": 0, "mar": 1, "mie": 2, "mié": 2, "jue": 3, "vie": 4, "sab": 5, "sáb": 5, "dom": 6}
 TICKET_CAPTION_RE = re.compile(r"^/ticket(?:@\w+)?\s+#?(\d+)", re.I)
+NOTE_CAPTION_RE = re.compile(r"^/note(?:@\w+)?\s+#?(\d+)\s*(.*)$", re.I | re.S)
 MY_COMMANDS = [("booked", "Tell me you booked a slot"), ("note", "Add a note to a market"),
                ("notes", "Notes of a market"), ("unbook", "Clear a booking")]
 
@@ -236,7 +238,8 @@ class BookingCommands:
         return bool(self._pending("note", "time") or self._card_event(msg.reply_to_message))
 
     def wants_file(self, msg: Message) -> bool:
-        return bool(TICKET_CAPTION_RE.match(msg.caption or "") or self._pending("ticket")
+        cap = msg.caption or ""
+        return bool(TICKET_CAPTION_RE.match(cap) or NOTE_CAPTION_RE.match(cap) or self._pending("ticket", "note")
                     or self._card_event(msg.reply_to_message))
 
     def _fmt(self, dt: datetime) -> str:
@@ -332,6 +335,8 @@ class BookingCommands:
                 self.pending = None
                 await q.answer()
                 await self._edit(q, "OK — no ticket. You can send it later with the caption /ticket <id>.")
+            elif parts[0] == "bk" and len(parts) == 3 and parts[1] in ("ft", "fn"):
+                await self._cb_file(q, parts[1], int(parts[2]))
             elif parts[0] == "bk" and len(parts) >= 3 and parts[2].isdigit():
                 await self._cb_booking(q, parts)
             else:
@@ -348,6 +353,23 @@ class BookingCommands:
                 return
             await self.app.bot.send_message(self.chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
+    async def _cb_file(self, q, which: str, event_id: int) -> None:  # noqa: ANN001
+        p = self._pending("file")
+        if not p or p["event_id"] != event_id or not Path(p["path"]).is_file():
+            await q.answer("That photo has expired — send it again.")
+            return
+        self.pending = None
+        await q.answer()
+        path = Path(p["path"])
+        try:
+            await q.edit_message_reply_markup(None)
+        except TelegramError:
+            pass
+        if which == "ft":
+            await self._save_ticket(q.message, event_id, path)
+        else:
+            await self._picture_note(q.message, event_id, path, "")
+
     async def _cb_note(self, q, event_id: int) -> None:  # noqa: ANN001
         ev, _ = self._load(event_id)
         if ev is None:
@@ -356,7 +378,8 @@ class BookingCommands:
         self._ask("note", event_id)
         await q.answer()
         await self.app.bot.send_message(
-            self.chat_id, f"📝 What should I remember for <b>{escape(ev.title)}</b>? Send it as your next message.",
+            self.chat_id, f"📝 What should I remember for <b>{escape(ev.title)}</b>? Send it as your next message "
+                          "(text or a photo).",
             parse_mode=ParseMode.HTML, **self._reply_to(ev.telegram_message_id))
 
     async def _cb_booking(self, q, parts: list[str]) -> None:  # noqa: ANN001
@@ -517,7 +540,8 @@ class BookingCommands:
                                  f"<code>/note {event_id} …</code>.")
             return
         lines = [f"📝 <b>{escape(ev.title)}</b>"]
-        lines += [f"{i}. {escape(n.get('text', ''))}" for i, n in enumerate(notes, 1)]
+        lines += [f"{i}. {escape(n.get('text', ''))}" + (" 📷" if n.get("image") else "")
+                  for i, n in enumerate(notes, 1)]
         lines.append(f"\n<i>Delete one with /delnote {event_id} &lt;n&gt;</i>")
         await msg.reply_html("\n".join(lines))
 
@@ -557,16 +581,51 @@ class BookingCommands:
             await self._add_note(msg, event_id, text)
 
     async def on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """A photo/PDF is a ticket (caption /ticket N, after /ticket, a PDF on a card) or a picture note
+        (caption /note N …, a captioned photo on a card, after "📝 Add note"). An uncaptioned photo on a
+        card could be either, so it asks."""
         msg = update.effective_message
-        m = TICKET_CAPTION_RE.match(msg.caption or "")
-        p = self._pending("ticket")
-        event_id = int(m.group(1)) if m else (p["event_id"] if p else self._card_event(msg.reply_to_message))
-        if event_id is None:
+        cap = (msg.caption or "").strip()
+        tm, nm = TICKET_CAPTION_RE.match(cap), NOTE_CAPTION_RE.match(cap)
+        p_ticket, p_note = self._pending("ticket"), self._pending("note")
+        card = self._card_event(msg.reply_to_message)
+        if tm:
+            kind, event_id = "ticket", int(tm.group(1))
+        elif nm:
+            kind, event_id, cap = "note", int(nm.group(1)), nm.group(2).strip()
+        elif p_ticket:
+            kind, event_id = "ticket", p_ticket["event_id"]
+        elif p_note:
+            kind, event_id = "note", p_note["event_id"]
+        elif card is not None and msg.document and not (msg.document.mime_type or "").startswith("image/"):
+            kind, event_id = "ticket", card
+        elif card is not None and cap and not cap.startswith("/"):
+            kind, event_id = "note", card
+        elif card is not None:
+            kind, event_id = "ask", card
+        else:
             return
         ev, _ = self._load(event_id)
         if ev is None:
             await msg.reply_text(f"I don't know event #{event_id}.")
             return
+        got = await self._download(msg, event_id, kind)
+        if got is None:
+            return
+        self.pending = None
+        if kind == "ask":
+            self._ask("file", event_id, path=str(got))
+            await msg.reply_html(f"Is this the ticket for <b>{escape(ev.title)}</b>, or a photo to keep as a note?",
+                                 reply_markup=InlineKeyboardMarkup([[
+                                     InlineKeyboardButton("🎟 It's the ticket", callback_data=f"bk:ft:{event_id}"),
+                                     InlineKeyboardButton("📝 Keep as a note", callback_data=f"bk:fn:{event_id}")]]))
+            return
+        if kind == "note":
+            await self._picture_note(msg, event_id, got, cap)
+            return
+        await self._save_ticket(msg, event_id, got)
+
+    async def _download(self, msg, event_id: int, kind: str) -> Path | None:  # noqa: ANN001
         if msg.photo:
             tg_file, ext = await msg.photo[-1].get_file(), ".jpg"
         elif msg.document:
@@ -576,25 +635,51 @@ class BookingCommands:
                 else ".jpg" if (doc.mime_type or "").startswith("image/") else ".bin")
             tg_file = await doc.get_file()
         else:
-            return
-        path = bookings.ticket_dir(self.settings.data_dir) / f"{event_id}{ext}"
+            return None
+        if kind == "ticket":
+            path = bookings.ticket_dir(self.settings.data_dir) / f"{event_id}{ext}"
+        else:
+            path = bookings.note_dir(self.settings.data_dir) / f"{event_id}_{msg.message_id}{ext}"
         await tg_file.download_to_drive(path)
-        self.pending = None
-        await bookings.attach_ticket(self.db, event_id, path)
+        return path
+
+    def _attach_word(self) -> str:
+        cal = self.app.bot_data.get("calendar") if self.app else None
+        return "attached to your calendar entry" if cal is not None and getattr(cal, "can_attach", False) \
+            else "pinned in this chat"
+
+    async def _save_ticket(self, msg, event_id: int, path: Path) -> None:  # noqa: ANN001
+        ev, _ = self._load(event_id)
+        target = bookings.ticket_dir(self.settings.data_dir) / f"{event_id}{path.suffix}"
+        if path != target:
+            path.replace(target)
+        await bookings.attach_ticket(self.db, event_id, target)
         tail = "" if ev.booked_start else (f"\nIt isn't marked as booked yet — "
                                            f"<code>/booked {event_id} HH:MM</code> to add the slot.")
-        await msg.reply_html(f"🎟 Ticket saved for <b>{escape(ev.title)}</b> and pinned in this chat.{tail}")
+        await msg.reply_html(f"🎟 Ticket saved for <b>{escape(ev.title)}</b> and {self._attach_word()}.{tail}")
+
+    async def _picture_note(self, msg, event_id: int, path: Path, text: str) -> None:  # noqa: ANN001
+        ev = await bookings.add_note(self.db, event_id, text or "📷 photo", image=path)
+        if ev is None:
+            return
+        where = "your calendar entry" if ev.user_decision == "yes" else "the calendar once you mark it ✅"
+        await msg.reply_html(f"📝 Photo noted for <b>{escape(ev.title)}</b> — it goes on {where}.")
 
     # ------------------------------------------------------------------ hooks
+    def _calendar_attaches(self) -> bool:
+        """The calendar sync attaches the ticket (and pins it itself only if that upload fails)."""
+        cal = self.app.bot_data.get("calendar") if self.app is not None else None
+        return cal is not None and getattr(cal, "can_attach", False)
+
     async def on_booking(self, event_id: int, **_: Any) -> None:
         ev, _h = self._load(event_id)
-        if ev is not None and ev.ticket_path:
+        if ev is not None and ev.ticket_path and not self._calendar_attaches():
             await self.pin_ticket(event_id, ev.ticket_path)
         await self.refresh_card(event_id)
         self.schedule_reminders()
 
     async def on_ticket(self, event_id: int, path: str | None = None, **_: Any) -> None:
-        if path:
+        if path and not self._calendar_attaches():
             await self.pin_ticket(event_id, path)
         await self.refresh_card(event_id)
 

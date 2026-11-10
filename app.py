@@ -21,6 +21,8 @@ from scout.bot.booking_cmds import register_booking_cmds
 from scout.planner import setup_planner
 from scout.briefing import setup_briefing
 from scout.tickethunt import setup_ticket_hunt
+from scout.peeks import setup_peeks
+from scout.google_link import setup_google_link
 from scout.uptime import setup_uptime
 from scout.eventbrite import setup_booking_watcher
 from scout.parser.gemini import GeminiParser
@@ -55,7 +57,10 @@ def main() -> None:
     BotHandlers(scout, db, notifier, settings).register(app)
     setup_booking_watcher(app, settings, db)  # M3: Eventbrite booking pings, /bookings
     schedule_jobs(app, scout, settings, db)
-    setup_calendar(app, settings, db)  # M2: no-op unless GCAL_SA_JSON and GCAL_CALENDAR_ID are set
+    calendar = setup_calendar(app, settings, db)  # M2: no-op unless GCAL_SA_JSON and GCAL_CALENDAR_ID are set
+    drive = setup_google_link(app, settings, db, sa_email=calendar.sa_email if calendar else None)  # /google
+    if calendar is not None:
+        calendar.user_drive = drive  # tickets and note photos attached to calendar entries
     register_booking_cmds(app, settings, db, notifier)  # /booked, /note, tickets, market-day reminders
     app.add_error_handler(obs.ErrorReporter(settings.allowed_chat_id))
     autobook = setup_autobook(app, settings, db)
@@ -65,6 +70,7 @@ def main() -> None:
     setup_uptime(app, settings, db)  # tells you only when Scout was down or checks keep failing
     register_admin(app, settings, db, notifier)  # /merge, in-place card refresh on updates/merges
     setup_ticket_hunt(app, settings, db)  # /hunt: watch for released free tickets, only when asked
+    setup_peeks(app, settings, db)  # sneak peeks: item photos from stories, ⭐ → note + calendar
 
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
@@ -82,6 +88,7 @@ def main() -> None:
             ("autobook", "Auto-book free Eventbrite tickets"),
             ("merge", "Merge two duplicate markets"),
             ("plan", "Your market route for a day"),
+            ("google", "Link Google Drive for calendar attachments"),
             ("today", "Today's markets: briefing"),
             ("briefing", "Briefing for a day (e.g. /briefing tomorrow)"),
             ("pause", "Mute alerts"),

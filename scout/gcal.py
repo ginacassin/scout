@@ -11,8 +11,10 @@ where <key> is "2026-11-13" for a timed day or "2026-11-13..2026-11-15" for an a
 
 Once a slot is booked (scout.bookings.record_booking) the per-day entries and the "🎟 Book:"
 reminder are deleted and ONE timed "booked" entry remains; clearing the booking restores them.
-A ticket QR is uploaded to a Drive folder shared with the service account (GDRIVE_FOLDER_ID) and
-attached to the booked entry when possible; it is always pinned in the Telegram chat as well.
+The ticket QR and every note photo are uploaded to Google Drive and attached to the entries: to your
+own Drive once linked with /google (scout/google_link.py), else to a Shared Drive folder shared with
+the service account (GDRIVE_FOLDER_ID). The ticket is pinned in the Telegram chat only when it can't
+be attached. Uploaded files are remembered in state["files"] {local path: attachment}.
 Every calendar event also carries extendedProperties.private {scoutId, scoutKey}, so a lost
 column can be rebuilt from Google (events.list ?privateExtendedProperty=scoutId=N) and retries
 never duplicate.
@@ -206,7 +208,8 @@ def describe(ev: Event, handle: str | None, tz) -> str:  # noqa: ANN001
 
 
 def notes_text(ev: Event) -> str | None:
-    notes = [n.get("text", "") for n in ev.note_list if n.get("text")]
+    notes = [n.get("text", "") + (" 📷 (photo attached)" if n.get("image") else "")
+             for n in ev.note_list if n.get("text") or n.get("image")]
     return ("📝 Notes:\n" + "\n".join(f"• {n}" for n in notes)) if notes else None
 
 
@@ -227,10 +230,10 @@ def describe_booked(ev: Event, handle: str | None, tz, eventbrite_url: str | Non
     elif ev.booking_url:
         blocks.append(f"🎟 Booking: {ev.booking_url}")
     if ev.ticket_path:
-        t = [TICKET_IN_CHAT]
         if ticket and ticket.get("fileUrl"):
-            t.append(f"Ticket file (Google Drive, attached): {ticket['fileUrl']}")
-        blocks.append("\n".join(t))
+            blocks.append(f"🎫 Ticket QR: attached to this event\n{ticket['fileUrl']}")
+        else:
+            blocks.append(TICKET_IN_CHAT)
     notes = notes_text(ev)
     if notes:
         blocks.append(notes)
@@ -240,8 +243,13 @@ def describe_booked(ev: Event, handle: str | None, tz, eventbrite_url: str | Non
     return "\n\n".join(blocks)
 
 
+def _clean(att: dict[str, Any]) -> dict[str, Any]:
+    return {k: att[k] for k in ("fileUrl", "title", "mimeType", "fileId") if att.get(k)}
+
+
 def booked_event(ev: Event, handle: str | None, tz, eventbrite_url: str | None = None,  # noqa: ANN001
-                 ticket: dict[str, Any] | None = None) -> dict[str, Any]:
+                 ticket: dict[str, Any] | None = None,
+                 attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """The single timed calendar entry that replaces all dates once a slot is booked."""
     tzname = getattr(tz, "key", str(tz))
     start = ev.booked_start.astimezone(tz)
@@ -255,8 +263,10 @@ def booked_event(ev: Event, handle: str | None, tz, eventbrite_url: str | None =
         "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 60}]},
         "extendedProperties": {"private": {"scoutId": str(ev.id), "scoutKey": BOOKED}},
     }
-    if ticket and ticket.get("fileUrl"):
-        body["attachments"] = [{k: ticket[k] for k in ("fileUrl", "title", "mimeType", "fileId") if ticket.get(k)}]
+    if attachments is not None:  # always sent when attaching is possible, so removed files go too
+        body["attachments"] = [_clean(a) for a in attachments]
+    elif ticket and ticket.get("fileUrl"):
+        body["attachments"] = [_clean(ticket)]
     return body
 
 
@@ -268,7 +278,8 @@ def _hm(value: str | None) -> tuple[int, int] | None:
         return None
 
 
-def desired_events(ev: Event, handle: str | None, tz, now: datetime) -> dict[str, dict[str, Any]]:  # noqa: ANN001
+def desired_events(ev: Event, handle: str | None, tz, now: datetime,  # noqa: ANN001
+                   attachments: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
     """key -> Calendar API event body. Keys are stable so patches hit the right calendar entry."""
     days = ev.date_list
     if not days:
@@ -281,6 +292,8 @@ def desired_events(ev: Event, handle: str | None, tz, now: datetime) -> dict[str
         "location": ev.address or ev.area or "",
         "description": describe(ev, handle, tz),
     }
+    if attachments is not None:
+        common["attachments"] = [_clean(a) for a in attachments]
     out: dict[str, dict[str, Any]] = {}
 
     def add(key: str, start: dict[str, str], end: dict[str, str]) -> None:
@@ -341,17 +354,18 @@ def load_state(raw: str | None) -> dict[str, Any]:
     if isinstance(data, list):  # tolerate a bare list of ids
         return {"days": {f"legacy{i}": x for i, x in enumerate(data)}, "booking": None}
     out = {"days": dict(data.get("days") or {}), "booking": data.get("booking")}
-    for extra in (BOOKED, "ticket"):
+    for extra in (BOOKED, "ticket", "files"):
         if data.get(extra):
             out[extra] = data[extra]
     return out
 
 
 def dump_state(state: dict[str, Any]) -> str | None:
-    if not state["days"] and not state["booking"] and not state.get(BOOKED) and not state.get("ticket"):
+    if not state["days"] and not state["booking"] and not state.get(BOOKED) and not state.get("ticket") \
+            and not state.get("files"):
         return None
     out = {"days": state["days"], "booking": state["booking"]}
-    for extra in (BOOKED, "ticket"):
+    for extra in (BOOKED, "ticket", "files"):
         if state.get(extra):
             out[extra] = state[extra]
     return json.dumps(out)
@@ -375,6 +389,7 @@ class CalendarSync:
             sa_email = sa_email or tokens.email
         self.tokens = tokens
         self.sa_email = sa_email or "the service account"
+        self.user_drive = None  # scout.google_link.UserDrive, set by setup when configured
         self._locks: dict[int, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task] = set()
 
@@ -521,11 +536,14 @@ class CalendarSync:
                 log.info("Calendar: removed event %s", event_id)
             return
 
+        atts = await self._attachments(ev, state)
+        self._save_state(event_id, state)
         if booked:
+            ticket = (state.get("files") or {}).get(ev.ticket_path or "") or state.get("ticket")
             desired = {BOOKED: booked_event(ev, handle, self.tz, self._eventbrite_url(event_id, ev),
-                                            state.get("ticket"))}
+                                            ticket, atts)}
         else:
-            desired = desired_events(ev, handle, self.tz, self._now())
+            desired = desired_events(ev, handle, self.tz, self._now(), atts)
         had_any = bool(state["days"]) or bool(state.get(BOOKED))
 
         # Idempotency: with nothing recorded, adopt whatever Google already has for this scoutId.
@@ -604,15 +622,94 @@ class CalendarSync:
     def drive_folder(self) -> str:
         return getattr(self.settings, "gdrive_folder_id", "") or os.environ.get("GDRIVE_FOLDER_ID", "")
 
-    async def upload_ticket(self, event_id: int, path: str | Path) -> dict[str, Any] | None:
-        """Upload the QR/ticket into GDRIVE_FOLDER_ID (never shared publicly). None when not possible:
-        no folder configured, quota exceeded (folder in a My Drive) or any other Drive error."""
-        folder = self.drive_folder
+    @property
+    def user_drive_linked(self) -> bool:
+        return self.user_drive is not None and self.user_drive.linked
+
+    @property
+    def can_attach(self) -> bool:
+        """Files can go on calendar entries: your Drive is linked (/google) or a Shared Drive folder is set."""
+        return self.user_drive_linked or bool(self.drive_folder)
+
+    async def upload_file(self, event_id: int, path: str | Path, title: str) -> dict[str, Any] | None:
         path = Path(path)
-        if not folder or not path.is_file():
+        if not path.is_file():
             return None
+        if self.user_drive_linked:
+            try:
+                att = await self.user_drive.upload(path, title)
+                att["via"] = "user"
+                return att
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Upload to your Drive for event %s failed: %s", event_id, exc)
+                return None
+        return await self._sa_upload(event_id, path, title)
+
+    async def upload_ticket(self, event_id: int, path: str | Path) -> dict[str, Any] | None:
         ev, _ = self._load(event_id)
-        title = f"Scout ticket #{event_id} — {ev.title if ev else ''}".strip(" —")[:120] + path.suffix.lower()
+        title = f"Scout ticket #{event_id} — {ev.title if ev else ''}".strip(" —")[:120] + Path(path).suffix.lower()
+        return await self.upload_file(event_id, path, title)
+
+    async def _attachments(self, ev: Event, state: dict[str, Any]) -> list[dict[str, Any]] | None:
+        """Upload the ticket and note photos not uploaded yet; forget removed ones. None = can't attach."""
+        if not self.can_attach:
+            return None
+        files: dict[str, Any] = state.setdefault("files", {})
+        if state.get("ticket") and ev.ticket_path and ev.ticket_path not in files:
+            files[ev.ticket_path] = state.pop("ticket")  # pre-notes state shape
+        state.pop("ticket", None)
+        wanted = ([ev.ticket_path] if ev.ticket_path else []) + ev.note_images
+        wanted = [p for p in dict.fromkeys(wanted) if p and (p in files or Path(p).is_file())]
+        texts = {n["image"]: n.get("text", "") for n in ev.note_list if n.get("image")}
+        for p in wanted:
+            if p in files:
+                continue
+            if p == ev.ticket_path:
+                att = await self.upload_ticket(ev.id, p)
+                await self._ticket_result(ev.id, p, att is not None)
+            else:
+                label = (texts.get(p) or "photo").lstrip("⭐📷 ").strip()[:60]
+                att = await self.upload_file(ev.id, p, f"Scout #{ev.id} — {label}{Path(p).suffix.lower()}")
+            if att:
+                files[p] = att
+        for p in [p for p in files if p not in wanted]:
+            gone = files.pop(p)
+            if gone.get("via") == "user" and gone.get("fileId") and self.user_drive_linked:
+                await self.user_drive.delete(gone["fileId"])
+        if not files:
+            state.pop("files", None)
+        return [files[p] for p in wanted if p in files][:25]
+
+    async def _ticket_result(self, event_id: int, path: str, ok: bool) -> None:
+        """Attached → no pinned copy needed; failed → pin it in the chat so it's not lost."""
+        cmds = self.app.bot_data.get("booking_cmds") if self.app is not None else None
+        if cmds is None:
+            return
+        try:
+            if ok:
+                await cmds._unpin(event_id)
+            else:
+                await cmds.pin_ticket(event_id, path)
+        except Exception:  # noqa: BLE001
+            log.exception("Ticket pin/unpin for event %s failed", event_id)
+
+    async def backfill_attachments(self) -> int:
+        """After linking Drive: attach tickets and note photos to existing entries."""
+        with self.db.session() as s:
+            ids = [e.id for e in s.scalars(select(Event).where(Event.user_decision == "yes", Event.status != "past"))
+                   if e.ticket_path or e.note_images]
+        n = 0
+        for event_id in ids:
+            if await self.sync(event_id, reason="silent"):
+                n += 1
+        return n
+
+    async def _sa_upload(self, event_id: int, path: Path, title: str) -> dict[str, Any] | None:
+        """Upload into GDRIVE_FOLDER_ID (a Shared Drive folder, never shared publicly). None when not
+        possible: no folder configured, quota exceeded (folder in a My Drive) or any other Drive error."""
+        folder = self.drive_folder
+        if not folder:
+            return None
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         boundary = f"scout-{uuid.uuid4().hex}"
         meta = json.dumps({"name": title, "parents": [folder], "mimeType": mime})
@@ -631,8 +728,8 @@ class CalendarSync:
                 if self.db.get_setting(QUOTA_WARNED_KEY) != "1":
                     self.db.set_setting(QUOTA_WARNED_KEY, "1")
                     await self._send("ℹ️ I couldn't put the ticket in Google Drive: service accounts have no "
-                                     "storage in a personal My Drive. Use a folder in a Shared Drive (see README). "
-                                     "The ticket is pinned here in the chat instead.")
+                                     "storage in a personal My Drive. Send /google to link your own Drive instead. "
+                                     "The ticket is pinned here in the chat meanwhile.")
             else:
                 log.warning("Drive upload for event %s failed (%s); ticket stays in Telegram only", event_id, exc)
             return None
@@ -644,19 +741,7 @@ class CalendarSync:
                 "fileUrl": res.get("webViewLink") or f"https://drive.google.com/open?id={fid}"}
 
     async def attach_ticket(self, event_id: int, path: str | Path | None = None) -> bool:
-        """Upload (if a folder is configured) and re-sync so the booked entry carries the file."""
-        if path is None:
-            ev, _ = self._load(event_id)
-            path = ev.ticket_path if ev else None
-        if path:
-            ticket = await self.upload_ticket(event_id, path)
-            if ticket:
-                with self.db.session() as s:
-                    row = s.get(Event, event_id)
-                    if row:
-                        state = load_state(row.gcal_event_id)
-                        state["ticket"] = ticket
-                        row.gcal_event_id = dump_state(state)
+        """Re-sync so the entry carries the ticket (uploaded inside the sync when attaching is possible)."""
         return await self.sync(event_id, reason="ticket")
 
     # ---- Telegram feedback -------------------------------------------------------
@@ -710,22 +795,7 @@ class CalendarSync:
             self._spawn(self.sync(event_id, reason="silent" if _silent else "update", changes=changes))
 
     async def on_booking(self, event_id: int, **_) -> None:  # noqa: ANN003
-        ev, _h = self._load(event_id)
-        if ev is not None and ev.ticket_path:
-            self._spawn(self._booked_with_ticket(event_id, ev.ticket_path))
-        else:
-            self._spawn(self.sync(event_id, reason="booked"))
-
-    async def _booked_with_ticket(self, event_id: int, path: str) -> None:
-        ticket = await self.upload_ticket(event_id, path)
-        if ticket:
-            with self.db.session() as s:
-                row = s.get(Event, event_id)
-                if row:
-                    state = load_state(row.gcal_event_id)
-                    state["ticket"] = ticket
-                    row.gcal_event_id = dump_state(state)
-        await self.sync(event_id, reason="booked")
+        self._spawn(self.sync(event_id, reason="booked"))
 
     async def on_ticket(self, event_id: int, path: str | None = None, **_) -> None:  # noqa: ANN003
         self._spawn(self.attach_ticket(event_id, path))

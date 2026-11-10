@@ -14,6 +14,7 @@ class ItemKind(str, Enum):
     update = "update"  # new info for a known market: address, hours, cancellations, discounts
     reminder = "reminder"  # repeats a known market's details, nothing new
     last_day = "last_day"  # "último día", discounts on the final day
+    preview = "preview"  # photos of pieces that will be on sale at an upcoming market, no new facts
     unrelated = "unrelated"  # thank-yous, decor tips, team photos, essays, past-event recaps
 
 
@@ -68,4 +69,9 @@ class ParsedEvent(BaseModel):
 
 class ParseResult(BaseModel):
     kind: ItemKind
-    events: list[ParsedEvent] = Field(description="Empty for unrelated. Several when one post lists several markets.")
+    events: list[ParsedEvent] = Field(description="Empty for unrelated and preview. Several when one post lists several markets.")
+    items_for_sale: list[str] = Field(
+        default_factory=list,
+        description="When the images show actual pieces for sale at an upcoming market: short English names of "
+                    "the notable ones, most prominent first, at most 5 (e.g. 'rattan armchair', 'brass floor lamp'). "
+                    "Empty for flyers, text, people, rooms without clear pieces, or past markets.")

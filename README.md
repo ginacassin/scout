@@ -23,10 +23,11 @@ Design document: see the "Scout — Design Document" in the scout project.
 | `/booked <id> <HH:MM> [date]` | You booked a slot yourself (date optional for one-day markets; buttons otherwise) |
 | `/unbook <id>` | Clear a booking; the calendar gets all dates back |
 | `/ticket <id>` | Send the QR/ticket PDF next (or send a photo/PDF captioned `/ticket <id>` any time) |
-| `/note <id> <text>` | Remember something for a market (or just reply to its card with the text) |
+| `/note <id> <text>` | Remember something for a market (or reply to its card with text or a photo) |
 | `/notes <id>` · `/delnote <id> <n>` | List or delete notes |
 | `/today` · `/briefing [date]` | Briefing of the markets you're visiting that day |
 | `/plan [date]` | Booked and armed markets in time order, with drive times |
+| `/google` | Link your Google Drive so tickets and note photos are attached to calendar entries |
 | `/hunt <id> [before HH:MM]` | Watch an Eventbrite market for released free tickets (any slot, or earlier than the one you booked) · `/hunt <id> off` · `/hunt` lists |
 
 Cards of ✅ events show **🎟 I booked it** (Eventbrite markets: pick the day and time) and **📝 Add note**.
@@ -41,22 +42,35 @@ booking opening). As soon as a slot is booked — by the auto-booker or with `/b
 are deleted and **one timed entry** remains: "🎟 Alma Market — booked 10:30", with the full address,
 the Instagram and Eventbrite links, your notes, and who booked it. `/unbook` restores the dates.
 
-### Ticket QR on the calendar entry (optional, one-time setup)
+### Tickets and note photos on the calendar entry (`/google`, one-time setup)
 
-Google Calendar can only attach Google Drive files, and a service account has no Drive storage of
-its own, so uploads must go into a **Shared Drive** that the service account is a member of:
+Google Calendar can only attach Google Drive files, and a service account has no Drive storage on a
+personal Gmail. So Scout puts them in **your** Drive (folder "Scout"), with the narrowest permission
+there is — it only sees files it created — and attaches them to the calendar entries: the ticket QR
+on the booked entry, note photos (⭐ sneak peeks, photos you sent) on every entry of the market.
+Once linked, tickets are no longer pinned in the chat (they are only if an upload fails).
 
-1. Enable the **Google Drive API** in the Google Cloud project of the service account.
-2. In Google Drive create a Shared Drive (needs Google Workspace) or a folder inside one, and add the
-   service account email (`…@….iam.gserviceaccount.com`) as **Content manager**.
-3. Copy the folder id from its URL (`drive.google.com/drive/folders/<id>`) into `GDRIVE_FOLDER_ID`.
+1. Google Cloud console, project of the calendar service account → **APIs & Services → Library**:
+   enable **Google Drive API**.
+2. **OAuth consent screen**: External, any app name, your email → **Publish app** (in "Testing" the
+   link expires every 7 days; this scope needs no Google review).
+3. **Credentials → Create credentials → OAuth client ID**, type **TVs and Limited Input devices**.
+4. Dokploy → scout-bot → Environment: `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` → Deploy.
+5. Telegram: `/google`, open google.com/device, enter the code, allow. Existing tickets and note
+   photos are attached straight away. `/google off` unlinks.
 
-Files are never made public: they are visible only to the Shared Drive's members. Scopes default to
-`calendar.events drive.file`; if uploads fail with "File not found" for the folder, set
-`GOOGLE_SCOPES=calendar.events drive`. With a personal @gmail.com account (no Shared Drives) or a
-folder in your own My Drive, the upload fails with `storageQuotaExceeded`; Scout tells you once and
-carries on. **Either way** the QR/PDF is sent to the chat as a reply to the event card and pinned,
-and the calendar entry says "Ticket QR: in your Scout chat (pinned)".
+(Alternative for Google Workspace: a Shared Drive folder in `GDRIVE_FOLDER_ID`, written by the
+service account.)
+
+## Sneak peeks
+
+Many accounts post photos of what will be on sale (mostly stories). Gemini recognises them and names
+the notable pieces; Scout links them to the account's next market (or keeps them until it announces
+one) and, once the account stops posting for a few minutes, sends them as an album of up to 10,
+numbered, replying to the market's card, followed by ⭐ buttons. **⭐ 3** adds a note with that photo
+("⭐ rattan armchair (photo 3)") — it shows on the card, in the morning briefing and, with the photo
+attached, in the calendar (once the market is ✅); tap again to remove it. Reply to a photo with text
+to note it in your own words. Bigger batches wait behind **👀 Show more**. ❌ markets get no peeks.
 
 ## Ticket hunt (released free tickets)
 

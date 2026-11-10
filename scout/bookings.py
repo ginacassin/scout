@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from . import hooks
 from .db import BookingWatch, Database, Event
@@ -72,17 +73,46 @@ async def clear_booking(db: Database, event_id: int) -> Event | None:
     return ev
 
 
-async def add_note(db: Database, event_id: int, text: str) -> Event | None:
+async def add_note(db: Database, event_id: int, text: str, image: Path | str | None = None,
+                   **extra: Any) -> Event | None:
+    """Add a note; `image` (a file under DATA_DIR/notes) is attached to the calendar entry."""
     text = " ".join(text.split())
-    if not text:
+    if not text and not image:
         return None
     with db.session() as s:
         ev = s.get(Event, event_id)
         if ev is None:
             return None
-        ev.add_note(text)
+        ev.add_note(text or "📷", image=str(image) if image else None, **extra)
     await hooks.emit("note_added", event_id, text=text)
     return ev
+
+
+async def remove_notes(db: Database, event_id: int, **match: Any) -> int:
+    """Delete the notes whose fields equal `match` (e.g. peek=12). Their image files go too."""
+    import json
+
+    with db.session() as s:
+        ev = s.get(Event, event_id)
+        if ev is None:
+            return 0
+        notes = ev.note_list
+        keep = [n for n in notes if not all(n.get(k) == v for k, v in match.items())]
+        gone = [n for n in notes if n not in keep]
+        if not gone:
+            return 0
+        ev.notes = json.dumps(keep, ensure_ascii=False)
+    for n in gone:
+        if n.get("image"):
+            Path(n["image"]).unlink(missing_ok=True)
+    await hooks.emit("note_added", event_id, text="")
+    return len(gone)
+
+
+def note_dir(data_dir: Path | str) -> Path:
+    d = Path(data_dir) / "notes"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 async def delete_note(db: Database, event_id: int, index: int) -> str | None:
@@ -98,6 +128,8 @@ async def delete_note(db: Database, event_id: int, index: int) -> str | None:
             return None
         gone = notes.pop(index - 1)
         ev.notes = json.dumps(notes, ensure_ascii=False)
+    if gone.get("image"):
+        Path(gone["image"]).unlink(missing_ok=True)
     # The calendar description lists notes, so it refreshes on the same signal.
     await hooks.emit("note_added", event_id, text="")
     return gone.get("text", "")

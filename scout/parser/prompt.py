@@ -35,6 +35,13 @@ Rules
   * reminder: repeats an upcoming market already described, nothing new.
   * update: adds new facts (address, hours, booking time, cancellations, discounts).
   * last_day: "último día", final-day discounts.
+  * preview: photos or videos showing pieces that will be on sale (furniture, lamps, art,
+    tableware, clothes…) for the account's upcoming market, with no new date, hours,
+    address or booking facts. Return no events. Many stories in a row are like this.
+    A teaser that also shows pieces is still a teaser.
+- items_for_sale: whenever the images show actual pieces for an upcoming market (preview,
+  teaser, new_event…), name the notable ones briefly in English, most prominent first, at
+  most 5. Leave it empty for flyers, pure text, people, recaps of past markets.
 - region = madrid for any town in the Comunidad de Madrid (Madrid city, Alcobendas,
   Coslada, Aranjuez, Navacerrada, Majadahonda, Las Rozas, Pozuelo, Fuenlabrada, Cobo
   Calleja…); outside for other provinces (Alicante, Segovia, Málaga, Barcelona, Sevilla…);

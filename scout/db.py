@@ -148,10 +148,18 @@ class Event(Base):
     def note_list(self) -> list[dict[str, Any]]:
         return json.loads(self.notes or "[]")
 
-    def add_note(self, text: str) -> None:
+    def add_note(self, text: str, image: str | None = None, **extra: Any) -> None:
         notes = self.note_list
-        notes.append({"at": utcnow().isoformat(), "text": text})
+        note: dict[str, Any] = {"at": utcnow().isoformat(), "text": text}
+        if image:
+            note["image"] = image  # local file under DATA_DIR/notes; attached to the calendar entry
+        note.update({k: v for k, v in extra.items() if v is not None})
+        notes.append(note)
         self.notes = json.dumps(notes, ensure_ascii=False)
+
+    @property
+    def note_images(self) -> list[str]:
+        return [n["image"] for n in self.note_list if n.get("image")]
 
     @property
     def end_date(self) -> date | None:
@@ -189,6 +197,30 @@ class BookingWatch(Base):
     hunt_alerts: Mapped[str] = mapped_column(Text, default="[]")  # JSON: ISO times of alerts sent
     hunt_checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     hunt_status: Mapped[str | None] = mapped_column(String(200), nullable=True)  # last check, for /hunt
+
+
+class Peek(Base):
+    """A photo of pieces for sale at a market (usually a story), shown to you as a sneak peek."""
+
+    __tablename__ = "peeks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id"), nullable=True, index=True)
+    ig_id: Mapped[str] = mapped_column(String(80), index=True)
+    url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    image_path: Mapped[str] = mapped_column(String(500))
+    items: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of short English names
+    state: Mapped[str] = mapped_column(String(10), default="new")  # new | held | sent
+    starred: Mapped[bool] = mapped_column(Boolean, default=False)
+    number: Mapped[int | None] = mapped_column(Integer, nullable=True)  # its number in the album
+    telegram_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # the photo
+    keyboard_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # the ⭐ buttons
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=lambda: utcnow())
+
+    @property
+    def item_list(self) -> list[str]:
+        return json.loads(self.items or "[]")
 
 
 class Setting(Base):

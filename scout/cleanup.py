@@ -87,10 +87,14 @@ def run_cleanup(db: Database, settings, now: datetime | None = None, days: int |
                 if col.table.name == "booking_watches":
                     counts["watch_rows"] += res.rowcount or 0
             for ev in doomed:
-                for f in (ev.media_path, ev.ticket_path):
+                for f in (ev.media_path, ev.ticket_path, *ev.note_images):
                     counts["files"] += _remove_file(f, data_dir)
                 s.delete(ev)
             counts["events"] = len(ids)
+
+        # Sneak-peek photos whose account never announced a market for them.
+        from .db import Peek
+        s.execute(delete(Peek).where(Peek.event_id.is_(None), Peek.created_at < now - timedelta(days=30)))
 
         for item in s.scalars(select(SourceItem).where(
             SourceItem.created_at < item_cutoff,

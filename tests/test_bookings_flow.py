@@ -105,6 +105,7 @@ def world(tmp_path, monkeypatch):
     app.bot_data["calendar"] = sync
     cmds = BookingCommands(app, settings, db, now=lambda: NOW)
     cmds.register_hooks()
+    app.bot_data["booking_cmds"] = cmds
     yield SimpleNamespace(sync=sync, db=db, google=google, app=app, cmds=cmds, tmp=tmp_path)
     hooks.clear()
     T.EXTRA_ANSWERED_BUTTONS.clear()
@@ -233,9 +234,9 @@ async def test_ticket_uploaded_to_drive_and_attached(world, monkeypatch):
     assert e["attachments"] == [{"fileUrl": "https://drive.google.com/file/d/f1/view", "title": "Scout ticket #1.png",
                                  "mimeType": "image/png", "fileId": "f1"}]
     assert {"supportsAttachments": "true"} in w.google.params
-    assert "Ticket QR: in your Scout chat (pinned)" in e["description"]
-    # Telegram copy is always made too
-    assert len(w.app.bot.named("pin_chat_message")) == 1
+    assert "Ticket QR: attached to this event" in e["description"]
+    # attached to the calendar: no pinned copy in the chat
+    assert w.app.bot.named("pin_chat_message") == []
 
 
 async def test_drive_quota_exceeded_falls_back_to_telegram(world, monkeypatch):
@@ -248,15 +249,16 @@ async def test_drive_quota_exceeded_falls_back_to_telegram(world, monkeypatch):
     await w.sync.drain()
 
     e = w.google.by_key()["booked"]
-    assert "attachments" not in e
+    assert e.get("attachments", []) == []
     assert "Ticket QR: in your Scout chat (pinned)" in e["description"]
-    infos = [c for c in w.app.bot.named("send_message") if "Shared Drive" in str(c)]
+    infos = [c for c in w.app.bot.named("send_message") if "/google" in str(c)]
     assert len(infos) == 1
     assert w.db.get_setting("gdrive_quota_warned") == "1"
+    assert len(w.app.bot.named("pin_chat_message")) == 1  # upload failed: pinned instead
     # second ticket: no second warning
     await bookings.attach_ticket(w.db, ev_id, png(w.tmp, "qr2.png"))
     await w.sync.drain()
-    assert len([c for c in w.app.bot.named("send_message") if "Shared Drive" in str(c)]) == 1
+    assert len([c for c in w.app.bot.named("send_message") if "/google" in str(c)]) == 1
 
 
 async def test_telegram_pin_fallback_without_drive(world):

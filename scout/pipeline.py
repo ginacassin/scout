@@ -14,7 +14,7 @@ from sqlalchemy import select
 
 from . import hooks
 from .config import Settings
-from .db import Account, Database, Event, SourceItem, utcnow
+from .db import Account, Database, Event, Peek, SourceItem, utcnow
 from .dedupe import GeminiTieBreaker, Matcher, latest_caption, merge_events, post_key, upgrade_address
 from .matching import (DIFFERENT, MAYBE, MergeOutcome, address_specificity, compare, event_status,
                        facts_from_event, facts_from_parsed, parse_dates)
@@ -242,7 +242,10 @@ class Scout:
 
         if result.kind == ItemKind.unrelated or not result.events:
             log.info("item %s", kv(ig_id=c.ig_id, kind=c.kind, account=c.account.handle,
-                                   classification=result.kind.value, events=0))
+                                   classification=result.kind.value, events=0,
+                                   items=len(result.items_for_sale) or None))
+            if result.kind != ItemKind.unrelated:
+                self.store_peeks(c, result.items_for_sale, images, [], now)
             return 1
 
         event_ids = []
@@ -252,9 +255,42 @@ class Scout:
                 event_ids.append(ev_id)
         with self.db.session() as s:
             s.get(SourceItem, item_id).event_ids = json.dumps(event_ids)
+        self.store_peeks(c, result.items_for_sale, images, event_ids, now)
         log.info("item %s", kv(ig_id=c.ig_id, kind=c.kind, account=c.account.handle, classification=result.kind.value,
                                events=len(result.events), event_ids=",".join(map(str, event_ids)) or None))
         return 1
+
+    # ------------------------------------------------------------ sneak peeks
+    def upcoming_event_for(self, account_id: int, now: datetime) -> int | None:
+        """The market an item photo most likely belongs to: the account's next dated market, else its
+        newest dateless teaser (from the last 30 days)."""
+        today = now.astimezone(self.settings.tz).date()
+        with self.db.session() as s:
+            evs = list(s.scalars(select(Event).where(Event.account_id == account_id, Event.status != "past",
+                                                     Event.user_decision.not_in(("filtered",)))))
+        dated = [e for e in evs if e.date_list and max(e.date_list) >= today]
+        if dated:
+            return min(dated, key=lambda e: (min(d for d in e.date_list if d >= today), e.id)).id
+        recent = [e for e in evs if not e.date_list and e.created_at and now - e.created_at < timedelta(days=30)]
+        return max(recent, key=lambda e: e.created_at).id if recent else None
+
+    def store_peeks(self, c: Candidate, items: list[str], images: list[Path], event_ids: list[int],
+                    now: datetime) -> int:
+        """Keep photos of pieces for sale; scout/peeks.py sends them in albums. Without a known market
+        they wait (event_id NULL) until the account announces one."""
+        if not items or not images:
+            return 0
+        target = event_ids[0] if event_ids else self.upcoming_event_for(c.account.id, now)
+        with self.db.session() as s:
+            if target is not None:
+                ev = s.get(Event, target)
+                if ev is None or ev.user_decision in ("no", "filtered"):
+                    return 0
+            for img in images[:10]:
+                s.add(Peek(account_id=c.account.id, event_id=target, ig_id=c.ig_id, url=c.url,
+                           image_path=str(img), items=json.dumps(items[:5], ensure_ascii=False), created_at=now))
+        log.info("peeks %s", kv(ig_id=c.ig_id, account=c.account.handle, event_id=target, photos=min(len(images), 10)))
+        return min(len(images), 10)
 
     def _candidates(self, s, c: Candidate, parsed: ParsedEvent) -> tuple[list[Event], set[str], dict[int, str]]:  # noqa: ANN001
         """Open events of the same account, a collab partner or the named organizer; the brand handles
