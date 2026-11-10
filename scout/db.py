@@ -182,6 +182,13 @@ class BookingWatch(Base):
     autobook: Mapped[bool] = mapped_column(Boolean, default=False)
     autobook_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Ticket hunt (scout/tickethunt.py): only when you ask, until 09:00 on the market's first day.
+    hunt_on: Mapped[bool] = mapped_column(Boolean, default=False)
+    hunt_before: Mapped[str | None] = mapped_column(String(5), nullable=True)  # "HH:MM" cut-off, optional
+    hunt_avail: Mapped[str] = mapped_column(Text, default="[]")  # JSON: matching slot keys free at last check
+    hunt_alerts: Mapped[str] = mapped_column(Text, default="[]")  # JSON: ISO times of alerts sent
+    hunt_checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    hunt_status: Mapped[str | None] = mapped_column(String(200), nullable=True)  # last check, for /hunt
 
 
 class Setting(Base):

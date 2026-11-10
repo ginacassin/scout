@@ -567,8 +567,9 @@ class BookingWatcher:
             flag = "🔔 on" if w.reminders_on else "🔕 off"
             pending = " <i>(not answered)</i>" if ev.user_decision == "pending" else ""
             link = f' · <a href="{escape(self._url_for(ev, w) or "", quote=True)}">link</a>' if w.eventbrite_id else ""
+            hunt = " · 🔎 watching for released tickets" if getattr(w, "hunt_on", False) else ""
             lines.append(f"\n🪑 <b>{escape(ev.title)}</b>{pending}\n⏰ {when} · {STATE_LABEL.get(w.state, w.state)}"
-                         f" · {flag}{link}")
+                         f" · {flag}{link}{hunt}")
         return "\n".join(lines)
 
     async def cmd_bookings(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

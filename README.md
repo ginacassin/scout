@@ -27,6 +27,7 @@ Design document: see the "Scout — Design Document" in the scout project.
 | `/notes <id>` · `/delnote <id> <n>` | List or delete notes |
 | `/today` · `/briefing [date]` | Briefing of the markets you're visiting that day |
 | `/plan [date]` | Booked and armed markets in time order, with drive times |
+| `/hunt <id> [before HH:MM]` | Watch an Eventbrite market for released free tickets (any slot, or earlier than the one you booked) · `/hunt <id> off` · `/hunt` lists |
 
 Cards of ✅ events show **🎟 I booked it** (Eventbrite markets: pick the day and time) and **📝 Add note**.
 Booked events show "🎟 Booked Fri 13 Nov 10:30 (by you/auto)" and notes appear on the card, in the
@@ -56,6 +57,22 @@ Files are never made public: they are visible only to the Shared Drive's members
 folder in your own My Drive, the upload fails with `storageQuotaExceeded`; Scout tells you once and
 carries on. **Either way** the QR/PDF is sent to the chat as a reply to the event card and pinned,
 and the calendar entry says "Ticket QR: in your Scout chat (pinned)".
+
+## Ticket hunt (released free tickets)
+
+Only when you ask: `/hunt 18`, or **🔎 Watch for free tickets** on a ✅/🤔 card.
+
+- **No ticket yet** → tells you when any free slot is available.
+- **Already booked** → tells you only when a slot *earlier* than yours frees up (the first slots are the
+  best). If you switch, cancel the old ticket on Eventbrite and send `/booked <id> HH:MM`; the hunt then
+  looks for slots earlier than the new one.
+- `/hunt 18 before 11:00` adds a cut-off.
+
+Scout reads every slot's availability (Eventbrite API with `EVENTBRITE_TOKEN`, otherwise the public
+page) every `TICKET_HUNT_MINUTES` (5 with a token, 10 without), messages you only when a matching slot
+*becomes* free (at most 10 alerts a day per market), sends silently between 23:00 and 08:00, and stops
+at **09:00 on the market's first day**. When Eventbrite only shows whole-event availability (one ticket
+type, no times), the alert says so.
 
 ## Data retention
 

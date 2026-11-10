@@ -299,6 +299,36 @@ class EventbriteClient:
             return TicketStatus(None, None, "unknown", final or url, source="none")
         return status_from_ld(events[0], final or url)
 
+    async def slot_states(self, eid: str, url: str | None = None) -> list["SlotInfo"] | None:
+        """Availability of every timed slot (see slots.py). None when Eventbrite couldn't be read."""
+        from .slots import slots_from_api, slots_from_ld
+
+        url = url or default_event_url(eid)
+        try:
+            if self._api_ok():
+                ev = await self._api(f"/events/{eid}/", {"expand": "ticket_availability,event_sales_status"})
+                if ev is not None:
+                    children = None
+                    series = ev.get("series_id") if (ev.get("is_series") or ev.get("is_series_parent")) else None
+                    if series:
+                        data = await self._api(f"/series/{series}/events/",
+                                               {"time_filter": "current_future",
+                                                "expand": "ticket_availability,event_sales_status"})
+                        children = (data or {}).get("events") or None
+                    classes = None
+                    if not children:
+                        tc = await self._api(f"/events/{eid}/ticket_classes/")
+                        classes = (tc or {}).get("ticket_classes")
+                    return slots_from_api(ev, classes, children)
+            # Public page: no cache here, a released ticket can go within minutes.
+            self._page_cache.pop(url, None)
+            _, html = await self.fetch_page(url)
+            events = ld_events(html)
+            return slots_from_ld(events) if events else None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Eventbrite slots for %s failed: %s", eid, exc)
+            return None
+
     async def event_info(self, eid: str, url: str | None = None) -> EBEvent:
         url = url or default_event_url(eid)
         try:

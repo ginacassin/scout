@@ -195,6 +195,7 @@ HELP = (
     "/status — last checks and Apify credit\n"
     "/logs — recent warnings and errors (<code>/logs all</code> for everything)\n"
     "/booked <i>id HH:MM [date]</i> — tell me you booked a slot · /unbook <i>id</i>\n"
+    "/hunt <i>id [before HH:MM]</i> — watch for released free tickets (or an earlier slot than yours) · <code>/hunt id off</code>\n"
     "/note <i>id text</i> — remember something for a market (or reply to its card) · /notes · /delnote\n\n"
     "You can also paste an Instagram profile link."
 )
