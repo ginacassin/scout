@@ -23,6 +23,7 @@ from scout.briefing import setup_briefing
 from scout.tickethunt import setup_ticket_hunt
 from scout.peeks import setup_peeks
 from scout.google_link import setup_google_link
+from scout.tasks import setup_tasks
 from scout.uptime import setup_uptime
 from scout.eventbrite import setup_booking_watcher
 from scout.parser.gemini import GeminiParser
@@ -52,6 +53,7 @@ def main() -> None:
     db.seed_accounts(settings.seed_accounts)
 
     app = Application.builder().token(settings.bot_token).build()
+    tasks = setup_tasks(app, settings, db)  # recurring jobs, run by Dokploy Schedules (python -m scout.cron …)
     notifier = TelegramNotifier(app, db, settings.allowed_chat_id, settings.tz)
     scout = Scout(settings, db, build_source(settings), GeminiParser(settings.gemini_api_key, settings.gemini_model), notifier)
     BotHandlers(scout, db, notifier, settings).register(app)
@@ -95,6 +97,7 @@ def main() -> None:
             ("resume", "Unmute alerts"),
             ("help", "What Scout does"),
         ])
+        await tasks.start()
         # No "I'm up" message: you only hear about outages (scout/uptime.py).
         log.info("Scout up, following %d accounts", len(db.active_accounts()))
 

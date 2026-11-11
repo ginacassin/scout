@@ -94,7 +94,13 @@ class BookingWatcher:
         self.app.add_handler(CommandHandler("bookings", self.cmd_bookings,
                                             filters=filters.Chat(chat_id=self.chat_id)))
         self.jq.run_once(self._startup_job, when=5, name="eb-startup")
-        self.jq.run_daily(self._daily_job, time(hour=9, minute=13, tzinfo=self.tz), name="eb-daily")
+        tasks = self.app.bot_data.get("tasks")
+        if tasks is not None:
+            async def daily() -> str:
+                await self.daily()
+                return "Eventbrite watches refreshed"
+            tasks.register("eventbrite-refresh", daily,
+                           "Re-check every watched Eventbrite page (opening times, sold out)", "13 9 * * *")
 
     # ================================================================== hooks
     async def on_decision_changed(self, event_id: int, old: str = "", new: str = "", **_: Any) -> None:

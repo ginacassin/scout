@@ -96,14 +96,39 @@ got a date go after 60 days. Instagram items older than 30 days keep only their 
 never processed twice) — caption, parsed data and images are dropped. Google Calendar entries stay
 as history.
 
-## Schedule (Europe/Madrid)
+## Schedule — Dokploy Schedules
 
-- Posts and bios: 08:02, 11:02, 14:02, 17:02, 20:02, 23:02 (`POLL_HOURS`)
-- Stories: 13:00 and 21:00 daily (stories live 24 h, so two reads 8 and 16 h apart catch every one); also on `/add` for the new account, and once after a restart if the last read is over 12 h old
-- Upkeep: 04:00 (past events, image pruning, retention cleanup)
-- Morning briefing: 08:00 on days with ✅/booked markets (`BRIEFING_TIME`): time order, Instagram account, what's on sale, hours, address, notes, drive times, one Maps route
-- Reminder 1 h before a booked slot
-- Eventbrite login check for the auto-booker: 12:17 daily (warns once if logged out)
+Recurring jobs are **Dokploy schedules** on the scout-bot service (Schedules tab), so you can see,
+change, pause and launch them yourself. Each runs one command inside the container, which asks the
+running bot to do the job and prints the result (exit code 0 = ok):
+
+| Task name | Cron (timezone **Europe/Madrid**) | Command |
+| --- | --- | --- |
+| Check posts | `2 8,11,14,17,20,23 * * *` | `python -m scout.cron check-posts` |
+| Check stories | `0 13,21 * * *` | `python -m scout.cron check-stories` |
+| Upkeep | `0 4 * * *` | `python -m scout.cron upkeep` |
+| Morning briefing | `0 8 * * *` | `python -m scout.cron briefing` |
+| Eventbrite refresh | `13 9 * * *` | `python -m scout.cron eventbrite-refresh` |
+| Eventbrite login check | `17 12 * * *` | `python -m scout.cron eventbrite-login` |
+
+Shell type Bash. To run one now: **Run** on its row (or `python -m scout.cron <task>` in the
+container terminal); `python -m scout.cron list` shows each task's last run. If Check posts or
+Check stories stops running (schedule deleted or disabled), Scout tells you once in Telegram.
+
+What a task does: **check-posts** reads every account's posts and bio (Apify), **check-stories**
+their stories (they live 24 h, so 13:00 and 21:00 catch them all), **upkeep** merges duplicates,
+marks past markets, prunes images and deletes events 14 days after they end, **briefing** sends the
+morning briefing on days with ✅/booked markets, **eventbrite-refresh** re-reads every watched
+Eventbrite page, **eventbrite-login** warns once if the auto-booker is logged out.
+
+Still inside the bot (they depend on each market's own times or run every minute): the booking
+countdown (15 min, 1 min, now) and fast checks around an opening, the market-day and "1 h before
+your slot" reminders, the ticket hunt, sneak-peek sending, the calendar retry, the heartbeat. Also
+inside: after a restart, one posts check if the last is more than 3 h old and one stories check if
+the last is more than 12 h old.
+
+Local runs without Dokploy: `SCHEDULER=internal` makes the bot run the tasks itself on the crons
+above (`POLL_HOURS` and `BRIEFING_TIME` then change those two).
 
 Apify cost: posts about $0.0027 per account per check (6 checks a day), stories $0.0025 per story found plus a small start fee per run. With 14 accounts that is roughly $9–11/month, above the free $5; Scout warns at 80 % of `APIFY_MONTHLY_BUDGET_USD`. Fewer `POLL_HOURS` is the cheapest lever.
 

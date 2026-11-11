@@ -588,36 +588,55 @@ class BotHandlers:
 STORY_HOURS = (13, 21)  # Madrid time, on the hour (accounts post their stories in the morning)
 
 def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # noqa: ANN001
+    """Register the Instagram checks and upkeep as tasks (run by Dokploy Schedules, see scout/tasks.py)
+    and schedule the one-off catch-ups after a restart."""
     jq = app.job_queue
-    tz = settings.tz
+    tasks = app.bot_data.get("tasks")
 
-    async def poll_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def check_posts() -> str:
         up = app.bot_data.get("uptime")
         try:
-            async with obs.trace("poll_profiles", job=ctx.job.name if ctx.job else None):
+            async with obs.trace("poll_profiles"):
                 counts = await scout.poll_profiles()
                 log.info("Profile poll done: %s", counts)
                 await _check_budget(scout, db, settings, app)
-        except Exception as exc:  # noqa: BLE001 - logged by trace; reported after repeated failures
+        except Exception as exc:
             if up:
                 await up.poll_result(False, f"{type(exc).__name__}: {exc}")
-            return
+            raise
         if up:
             await up.poll_result(True)
+        return f"{len(counts)} accounts read, {sum(counts.values())} new item(s)"
 
-    async def stories_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        async with obs.trace("poll_stories", swallow=True):
+    async def check_stories() -> str:
+        async with obs.trace("poll_stories"):
             n = await scout.poll_stories()
-            log.info("Story poll done: %d new", n)
+        log.info("Story poll done: %d new", n)
+        return f"{n} new stor{'y' if n == 1 else 'ies'}"
 
-    async def upkeep_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        async with obs.trace("upkeep", swallow=True):
+    async def upkeep() -> str:
+        async with obs.trace("upkeep"):
             merged = await scout.dedupe_events()
             n = scout.mark_past_events()
-            log.info("Upkeep: %d duplicate events merged", merged)
             removed = prune_media(settings.media_dir)
-            log.info("Upkeep: %d events marked past, %d images pruned", n, removed)
-            from ..cleanup import run_cleanup; run_cleanup(db, settings)  # noqa: E702 — retention (RETENTION_DAYS)
+            from ..cleanup import run_cleanup
+            counts = run_cleanup(db, settings)  # retention (RETENTION_DAYS)
+        log.info("Upkeep: %d merged, %d past, %d images pruned", merged, n, removed)
+        return (f"{merged} duplicates merged, {n} marked past, {removed} images pruned, "
+                f"{counts.get('events', 0)} old events deleted")
+
+    if tasks is not None:
+        hours = ",".join(str(h) for h in settings.poll_hours)
+        tasks.register("check-posts", check_posts, "Read every account's posts and bio", f"2 {hours} * * *")
+        tasks.register("check-stories", check_stories, "Read every account's current stories",
+                       "0 " + ",".join(str(h) for h in STORY_HOURS) + " * * *")
+        tasks.register("upkeep", upkeep, "Merge duplicates, mark past markets, prune images, delete old events",
+                       "0 4 * * *")
+
+    async def run_soon(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if tasks is not None:
+            ok, summary = await tasks.run(ctx.job.data, trigger="startup")
+            log.info("Startup %s: %s", ctx.job.data, summary)
 
     async def dedupe_once(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         n = await scout.dedupe_events()
@@ -625,17 +644,12 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
             log.info("Startup: merged %d duplicate events", n)
 
     jq.run_once(dedupe_once, when=timedelta(seconds=3), name="startup-dedupe")
-    for h in settings.poll_hours:
-        jq.run_daily(poll_job, time(hour=h, minute=2, tzinfo=tz), name=f"poll-{h:02d}")
-    for h in STORY_HOURS:  # stories live 24 h; two reads 12 h apart so none slips through
-        jq.run_daily(stories_job, time(hour=h, minute=0, tzinfo=tz), name=f"stories-{h:02d}")
-    jq.run_daily(upkeep_job, time(hour=4, minute=0, tzinfo=tz), name="upkeep")
 
     # First run after a fresh install, or if the last good poll is older than 3 h.
     beat = settings.heartbeat_file
     stale = not beat.exists() or (datetime.now().timestamp() - beat.stat().st_mtime) > 3 * 3600
     if stale:
-        jq.run_once(poll_job, when=timedelta(seconds=30), name="startup-poll")
+        jq.run_once(run_soon, when=timedelta(seconds=30), name="startup-poll", data="check-posts")
 
     # Catch up on stories after downtime or a deploy: if the last full story read is over 12 h old.
     last_st = db.get_setting(STORIES_AT_KEY)
@@ -644,7 +658,7 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
     except ValueError:
         st_age = None
     if st_age is None or st_age > 12 * 3600:
-        jq.run_once(stories_job, when=timedelta(seconds=90), name="startup-stories")
+        jq.run_once(run_soon, when=timedelta(seconds=90), name="startup-stories", data="check-stories")
 
 
 async def _check_budget(scout, db: Database, settings, app: Application) -> None:  # noqa: ANN001

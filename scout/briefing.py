@@ -239,8 +239,21 @@ def setup_briefing(app: Application, settings, db: Database) -> Briefing:  # noq
     only_me = filters.Chat(chat_id=settings.allowed_chat_id)
     app.add_handler(CommandHandler("today", b.cmd_today, filters=only_me))
     app.add_handler(CommandHandler("briefing", b.cmd_briefing, filters=only_me))
+    tasks = app.bot_data.get("tasks")
+    if tasks is not None:
+        bt = _briefing_time()
+
+        async def briefing() -> str:
+            return "briefing sent" if await b.send() else "no markets today (or already sent)"
+
+        async def login() -> str:
+            await b.login_check()
+            return "checked"
+
+        tasks.register("briefing", briefing, "Morning briefing on days with ✅/booked markets",
+                       f"{bt.minute} {bt.hour} * * *")
+        tasks.register("eventbrite-login", login, "Warn once if the auto-booker is logged out of Eventbrite",
+                       "17 12 * * *")
     if app.job_queue is not None:
-        app.job_queue.run_daily(b.daily_job, _briefing_time().replace(tzinfo=settings.tz), name="briefing")
         app.job_queue.run_once(b.catch_up, when=15, name="briefing-catch-up")
-        app.job_queue.run_daily(b.login_check, time(12, 17, tzinfo=settings.tz), name="eventbrite-login-check")
     return b
