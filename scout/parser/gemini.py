@@ -15,7 +15,7 @@ from google.genai import types
 
 from ..obs import STATS, kv
 from .prompt import SYSTEM_PROMPT, build_user_prompt
-from .schema import ParseResult
+from .schema import GeminiParseResult, ParseResult
 
 log = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ class GeminiParser:
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
-            response_schema=ParseResult,
+            response_schema=GeminiParseResult,
             media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
             temperature=0.1,
         )
@@ -108,7 +108,7 @@ class GeminiParser:
                 self._log_usage(resp, handle, item_kind, len(contents) - 1, int((time.perf_counter() - t0) * 1000))
                 if isinstance(resp.parsed, ParseResult):
                     return resp.parsed
-                return ParseResult.model_validate_json(resp.text or "{}")
+                return GeminiParseResult.model_validate_json(resp.text or "{}")
             except Exception as exc:  # noqa: BLE001 - retried, then raised
                 last_exc = exc
                 log.warning("Gemini parse failed %s: %s", kv(model=self.model, handle=handle, attempt=attempt + 1,

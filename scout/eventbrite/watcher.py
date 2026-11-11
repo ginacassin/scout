@@ -295,17 +295,21 @@ class BookingWatcher:
         keys = self._pings(w)
         flips = [k for k in keys if k.startswith(("live", "soldout"))]
         last = self._last_flip(keys)
+        # The first "live" is booking opening (early, or at an unannounced time): always worth a ping.
+        # Tickets coming back after selling out are the ticket hunt's job, only when you ask (/hunt):
+        # here they're just remembered so the card stays right. "Sold out" is said once.
         if st.state == "open":
-            if reason in ("cancellations", "cxlwatch"):
-                key = "cxl:" + self.now().strftime("%Y%m%d%H")
-                if key not in keys:
-                    await self._send(ev, w, "🔁 Cancellations — tickets available again", key)
-                return
             if last != "live" and len(flips) < MAX_FLIPS:
-                await self._send(ev, w, "🚨 Tickets are live", f"live{len(flips)}")
+                if not any(k.startswith("soldout") for k in keys):
+                    await self._send(ev, w, "🚨 Tickets are live", f"live{len(flips)}")
+                else:
+                    self._add_ping(ev.id, f"live{len(flips)}")
         elif st.state == "sold_out":
             if last != "soldout" and len(flips) < MAX_FLIPS:
-                await self._send(ev, w, "⛔ Sold out", f"soldout{len(flips)}")
+                if not any(k.startswith("soldout") for k in keys):
+                    await self._send(ev, w, "⛔ Sold out", f"soldout{len(flips)}")
+                else:
+                    self._add_ping(ev.id, f"soldout{len(flips)}")
 
     def _url_for(self, ev: Event, w: BookingWatch | None) -> str | None:
         if w and w.event_url:

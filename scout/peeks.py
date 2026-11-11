@@ -147,7 +147,7 @@ class Peeks:
         ev, handle = self._event(event_id)
         if ev is None:
             return 0
-        usable = [p for p in peeks if Path(p.image_path).is_file()]
+        usable = [p for p in peeks if Path(p.image_path).is_file() and Path(p.image_path).stat().st_size > 0]
         self._set_state([p.id for p in peeks if p not in usable], "sent")  # image pruned: nothing to show
         if not usable:
             return 0
@@ -155,21 +155,23 @@ class Peeks:
                                                       allow_sending_without_reply=True)}
                  if ev.telegram_message_id else {})
         bot = self.app.bot
-        files = []
         try:
-            files = [open(p.image_path, "rb") for p in usable]  # noqa: SIM115 - closed below
-            media = [InputMediaPhoto(f, caption=_caption(i, p.item_list)) for i, (f, p) in enumerate(zip(files, usable), 1)]
-            if len(media) == 1:
-                msgs = [await bot.send_photo(self.chat_id, files[0], caption=_caption(1, usable[0].item_list),
-                                             disable_notification=True, **reply)]
+            if len(usable) == 1:
+                p = usable[0]
+                msgs = [await bot.send_photo(self.chat_id, Path(p.image_path).read_bytes(),
+                                             caption=_caption(1, p.item_list), disable_notification=True, **reply)]
             else:
+                media = [InputMediaPhoto(Path(p.image_path).read_bytes(), caption=_caption(i, p.item_list))
+                         for i, p in enumerate(usable, 1)]
                 msgs = list(await bot.send_media_group(self.chat_id, media, disable_notification=True, **reply))
+        except BadRequest as exc:
+            # A broken image would fail forever: send the album without it next time.
+            log.warning("Sneak peek album for event %s refused (%s); dropping it", event_id, exc)
+            self._set_state([p.id for p in usable], "sent")
+            return 0
         except TelegramError:
             log.exception("Couldn't send sneak peek album for event %s", event_id)
             return 0
-        finally:
-            for f in files:
-                f.close()
         with self.db.session() as s:
             for i, (p, m) in enumerate(zip(usable, msgs), 1):
                 row = s.get(Peek, p.id)

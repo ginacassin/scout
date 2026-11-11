@@ -244,8 +244,8 @@ class Scout:
             log.info("item %s", kv(ig_id=c.ig_id, kind=c.kind, account=c.account.handle,
                                    classification=result.kind.value, events=0,
                                    items=len(result.items_for_sale) or None))
-            if result.kind != ItemKind.unrelated:
-                self.store_peeks(c, result.items_for_sale, images, [], now)
+            # Photos of pieces often come without text and get called "unrelated": the named items decide.
+            self.store_peeks(c, result.items_for_sale, images, [], now)
             return 1
 
         event_ids = []

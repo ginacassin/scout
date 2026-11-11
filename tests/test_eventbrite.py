@@ -478,7 +478,8 @@ async def test_free_entry_market_is_not_watched(wenv):
     assert w.get_watch(eid) is None
 
 
-async def test_cancellations_post_checks_immediately(wenv):
+async def test_cancellations_post_checks_immediately_but_stays_quiet(wenv):
+    """Released tickets only alert through /hunt; the watcher just refreshes the state."""
     w, db, app, clock, client = wenv
     w.register()
     eid = add_event(db, opens=mad(11, 6, 10))
@@ -490,8 +491,9 @@ async def test_cancellations_post_checks_immediately(wenv):
     await hooks.emit("event_updated", eid, changes=["tickets available again (cancellations)"])
     import asyncio
     await asyncio.gather(*w._tasks)
-    assert texts(app) == ["🔁 Cancellations — tickets available again"]
+    assert texts(app) == []
     assert "cxl" in app.job_queue.live(eid)
+    assert w.get_watch(eid).state == "live"
 
 
 async def test_toggle_buttons_and_bookings_list(wenv):

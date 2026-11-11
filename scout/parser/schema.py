@@ -75,3 +75,13 @@ class ParseResult(BaseModel):
         description="When the images show actual pieces for sale at an upcoming market: short English names of "
                     "the notable ones, most prominent first, at most 5 (e.g. 'rattan armchair', 'brass floor lamp'). "
                     "Empty for flyers, text, people, rooms without clear pieces, or past markets.")
+
+
+class GeminiParseResult(ParseResult):
+    """What Gemini must return: items_for_sale is required here (optional fields get skipped by the
+    model), while code building a ParseResult by hand can still leave it out."""
+
+    items_for_sale: list[str] = Field(
+        description="Short English names of the notable pieces for sale visible in the images (e.g. 'rattan "
+                    "armchair', 'brass floor lamp'), most prominent first, at most 5. [] for flyers, text-only "
+                    "images, people, or recaps of past markets.")

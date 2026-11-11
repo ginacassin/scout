@@ -354,7 +354,7 @@ class BotHandlers:
             "<b>Scout status</b>",
             f"Accounts: {len(accounts)}",
             f"Last successful check: {last.astimezone(tz):%a %-d %b %H:%M}" if last else "Last successful check: none yet",
-            "Checks: posts and bio at " + ", ".join(f"{h:02d}:00" for h in self.settings.poll_hours) + "; stories at " + " and ".join(f"{h:02d}:07" for h in STORY_HOURS),
+            "Checks: posts and bio at " + ", ".join(f"{h:02d}:00" for h in self.settings.poll_hours) + "; stories at " + " and ".join(f"{h:02d}:00" for h in STORY_HOURS),
             "Alerts: paused" if self.notifier.paused else "Alerts: on",
         ]
         if spend:
@@ -585,7 +585,7 @@ class BotHandlers:
 
 
 # ---------------------------------------------------------------------- jobs
-STORY_HOURS = (9, 21)  # Madrid time, at :07
+STORY_HOURS = (13, 21)  # Madrid time, on the hour (accounts post their stories in the morning)
 
 def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # noqa: ANN001
     jq = app.job_queue
@@ -628,7 +628,7 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
     for h in settings.poll_hours:
         jq.run_daily(poll_job, time(hour=h, minute=2, tzinfo=tz), name=f"poll-{h:02d}")
     for h in STORY_HOURS:  # stories live 24 h; two reads 12 h apart so none slips through
-        jq.run_daily(stories_job, time(hour=h, minute=7, tzinfo=tz), name=f"stories-{h:02d}")
+        jq.run_daily(stories_job, time(hour=h, minute=0, tzinfo=tz), name=f"stories-{h:02d}")
     jq.run_daily(upkeep_job, time(hour=4, minute=0, tzinfo=tz), name="upkeep")
 
     # First run after a fresh install, or if the last good poll is older than 3 h.

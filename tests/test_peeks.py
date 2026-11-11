@@ -28,10 +28,13 @@ class Bot:
         return SimpleNamespace(message_id=self.n)
 
     async def send_media_group(self, chat_id, media, **kw):
+        for m in media:
+            assert m.media.input_file_content, "album photo sent empty"
         self.calls.append(("album", [m.caption for m in media], kw))
         return [self._msg() for _ in media]
 
     async def send_photo(self, chat_id, photo, caption=None, **kw):
+        assert isinstance(photo, bytes) and photo, "photo sent empty"  # the Nov 11 bug
         self.calls.append(("photo", caption, kw))
         return self._msg()
 

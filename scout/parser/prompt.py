@@ -38,7 +38,9 @@ Rules
   * preview: photos or videos showing pieces that will be on sale (furniture, lamps, art,
     tableware, clothes…) for the account's upcoming market, with no new date, hours,
     address or booking facts. Return no events. Many stories in a row are like this.
-    A teaser that also shows pieces is still a teaser.
+    A teaser that also shows pieces is still a teaser. A story that is just a photo of a
+    chair, lamp, table or similar piece from an account that runs markets is a preview,
+    not unrelated.
 - items_for_sale: whenever the images show actual pieces for an upcoming market (preview,
   teaser, new_event…), name the notable ones briefly in English, most prominent first, at
   most 5. Leave it empty for flyers, pure text, people, recaps of past markets.
