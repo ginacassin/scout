@@ -205,3 +205,33 @@ async def test_no_eventbrite_link(henv):
     with db.session() as s:
         s.query(BookingWatch).one().eventbrite_id = None
     assert "nothing to watch" in await hunt.start(eid)
+
+
+async def test_checks_every_15_min_by_day_and_45_at_night(henv):
+    hunt, db, app, clock, client, eid = henv
+    client.slots = [slot(14, 10, 0, False)]
+    clock.t = mad(11, 11, 12, 0)
+    text = await hunt.start(eid)
+    assert "every 15 min (45 min at night, 00:00–05:30)" in text
+    n = client.calls
+    clock.t = mad(11, 11, 12, 14)
+    await hunt.tick()
+    assert client.calls == n  # 14 min: too soon
+    clock.t = mad(11, 11, 12, 15)
+    await hunt.tick()
+    assert client.calls == n + 1
+    clock.t = mad(11, 11, 23, 45)  # still daytime cadence
+    await hunt.tick()
+    n = client.calls
+    clock.t = mad(11, 12, 0, 15)  # 30 min later, now night: wait
+    await hunt.tick()
+    assert client.calls == n
+    clock.t = mad(11, 12, 0, 30)  # 45 min after the last check
+    await hunt.tick()
+    assert client.calls == n + 1
+    clock.t = mad(11, 12, 5, 30)  # night over: 15 min again
+    await hunt.tick()
+    n = client.calls
+    clock.t = mad(11, 12, 5, 45)
+    await hunt.tick()
+    assert client.calls == n + 1

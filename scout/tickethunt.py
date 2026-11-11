@@ -5,9 +5,9 @@ Two cases, same switch (/hunt <id>, or "🔎 Watch for free tickets" on the card
 - already booked → tell me when a slot *earlier* than mine is free (the first slots are the best).
 An optional cut-off narrows it further: `/hunt 18 before 11:00`.
 
-It only runs when you ask, checks every TICKET_HUNT_MINUTES (default 5 with an Eventbrite token,
-10 from the public page), alerts only when a matching slot *becomes* free (not every check), and stops
-at 09:00 on the market's first day. Alerts between 23:00 and 08:00 arrive silently.
+It only runs when you ask, checks every TICKET_HUNT_MINUTES (default 15) during the day and every
+TICKET_HUNT_NIGHT_MINUTES (default 45) from 00:00 to 05:30, alerts only when a matching slot *becomes* free (not every check), and stops
+at 09:00 on the market's first day. Alerts between 00:00 and 05:30 arrive silently.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 
 STOP_AT = time(9, 0)  # on the market's first day: too late to change plans after that
 MAX_ALERTS_PER_DAY = 10  # per market, against a flapping page
-QUIET = (time(23, 0), time(8, 0))
+NIGHT = (time(0, 0), time(5, 30))  # slower checks and silent alerts
 HHMM_RE = re.compile(r"^(\d{1,2})[:.h]?(\d{2})?$")
 
 
@@ -60,8 +60,8 @@ class TicketHunt:
         self.watcher = watcher
         self.client = client or (watcher.client if watcher else EventbriteClient(getattr(settings, "eventbrite_token", "")))
         self.now = now or utcnow
-        default = 5 if self.client.token else 10
-        self.interval = timedelta(minutes=max(2, int(os.environ.get("TICKET_HUNT_MINUTES", default))))
+        self.interval = timedelta(minutes=max(2, int(os.environ.get("TICKET_HUNT_MINUTES", 15))))
+        self.night_interval = timedelta(minutes=max(2, int(os.environ.get("TICKET_HUNT_NIGHT_MINUTES", 45))))
         self._busy = asyncio.Lock()
 
     # ============================================================ registration
@@ -213,7 +213,7 @@ class TicketHunt:
                                               url=f"https://www.eventbrite.es/checkout-external?eid={w.eventbrite_id}")])
         rows.append([InlineKeyboardButton("🛑 Stop watching", callback_data=f"th:off:{ev.id}")])
         local = self.now().astimezone(self.tz).time()
-        quiet = local >= QUIET[0] or local < QUIET[1]
+        quiet = NIGHT[0] <= local < NIGHT[1]
         try:
             await self.app.bot.send_message(self.chat_id, "\n".join(lines), parse_mode=ParseMode.HTML,
                                             reply_markup=InlineKeyboardMarkup(rows), disable_web_page_preview=True,
@@ -231,18 +231,30 @@ class TicketHunt:
             with self.db.session() as s:
                 rows = list(s.scalars(select(BookingWatch).where(BookingWatch.hunt_on.is_(True))))
             now = self.now()
+            interval = self.current_interval()
             for w in rows:
                 ev, _ = self._load(w.event_id)
                 if ev is not None and self._too_late(ev):  # stop on time, not at the next check
                     await self.stop(w.event_id, reason="deadline")
                     continue
-                if w.hunt_checked_at and now - w.hunt_checked_at < self.interval - timedelta(seconds=20):
+                if w.hunt_checked_at and now - w.hunt_checked_at < interval - timedelta(seconds=20):
                     continue
                 try:
                     await self.check(w.event_id)
                 except Exception:  # noqa: BLE001
                     log.exception("Ticket hunt check for event %s failed", w.event_id)
                 await asyncio.sleep(1)
+
+    def is_night(self) -> bool:
+        local = self.now().astimezone(self.tz).time()
+        return NIGHT[0] <= local < NIGHT[1]
+
+    def current_interval(self) -> timedelta:
+        return self.night_interval if self.is_night() else self.interval
+
+    def _cadence(self) -> str:
+        day, night = int(self.interval.total_seconds() // 60), int(self.night_interval.total_seconds() // 60)
+        return f"every {day} min ({night} min at night, 00:00–05:30)"
 
     # =========================================================== start / stop
     async def start(self, event_id: int, before: str | None = None) -> str:
@@ -260,7 +272,7 @@ class TicketHunt:
         result = await self.check(event_id)
         until = f" until {self._fmt(dl)}" if dl else ""
         lines = [f"🔎 Watching <b>{escape(ev.title)}</b> for free tickets: {self._target(ev, w)}.",
-                 f"I check every {int(self.interval.total_seconds() // 60)} min{until}, and only message you "
+                 f"I check {self._cadence()}{until}, and only message you "
                  "when a matching slot frees up."]
         if result is None:
             return "\n".join(lines)

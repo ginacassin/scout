@@ -83,8 +83,9 @@ Only when you ask: `/hunt 18`, or **🔎 Watch for free tickets** on a ✅/🤔 
 - `/hunt 18 before 11:00` adds a cut-off.
 
 Scout reads every slot's availability (Eventbrite API with `EVENTBRITE_TOKEN`, otherwise the public
-page) every `TICKET_HUNT_MINUTES` (5 with a token, 10 without), messages you only when a matching slot
-*becomes* free (at most 10 alerts a day per market), sends silently between 23:00 and 08:00, and stops
+page) every 15 minutes, and every 45 at night (00:00–05:30; `TICKET_HUNT_MINUTES`,
+`TICKET_HUNT_NIGHT_MINUTES`), messages you only when a matching slot *becomes* free (at most 10 alerts
+a day per market), silently at night, and stops
 at **09:00 on the market's first day**. When Eventbrite only shows whole-event availability (one ticket
 type, no times), the alert says so.
 
