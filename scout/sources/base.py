@@ -33,6 +33,9 @@ class StoryItem:
     image_url: str | None
     link_urls: list[str] = field(default_factory=list)
     is_video: bool = False
+    reshared_from: str | None = None  # author of a story this one reshares
+    shared_post_url: str | None = None  # someone else's post shown in this story
+    mentions: list[str] = field(default_factory=list)  # @mentions on the story
 
     @property
     def ig_id(self) -> str:

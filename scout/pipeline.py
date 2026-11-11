@@ -55,6 +55,9 @@ class Candidate:
     coauthors: list[str] | None = None
     link_urls: list[str] | None = None
     pinned: bool = False
+    reshared_from: str | None = None  # story reshared from this account
+    shared_post_url: str | None = None  # someone else's post shown in the story
+    mentions: list[str] | None = None
 
 
 def bio_ig_id(handle: str, bio: str, links: list[str]) -> str:
@@ -127,6 +130,9 @@ class Scout:
                     caption="",
                     image_urls=[st.image_url] if st.image_url else [],
                     link_urls=st.link_urls,
+                    reshared_from=getattr(st, "reshared_from", None),
+                    shared_post_url=getattr(st, "shared_post_url", None),
+                    mentions=getattr(st, "mentions", None),
                 )
             )
         return new
@@ -225,6 +231,9 @@ class Scout:
                 bio=c.account.last_bio if c.kind != "bio" else None,
                 bio_links=c.account.bio_links,
                 link_urls=c.link_urls,
+                reshared_from=c.reshared_from,
+                shared_post_url=c.shared_post_url,
+                mentions=c.mentions,
             )
         except Exception:  # noqa: BLE001 - leave unseen so the next poll retries it
             log.exception("Parse failed for %s", c.ig_id)
@@ -253,12 +262,28 @@ class Scout:
             ev_id = await self.handle_event(c, parsed, result.kind, images, now)
             if ev_id:
                 event_ids.append(ev_id)
+                self.record_organizer(ev_id, parsed, c)
         with self.db.session() as s:
             s.get(SourceItem, item_id).event_ids = json.dumps(event_ids)
         self.store_peeks(c, result.items_for_sale, images, event_ids, now)
         log.info("item %s", kv(ig_id=c.ig_id, kind=c.kind, account=c.account.handle, classification=result.kind.value,
                                events=len(result.events), event_ids=",".join(map(str, event_ids)) or None))
         return 1
+
+    # -------------------------------------------------------------- organiser
+    def record_organizer(self, event_id: int, parsed: ParsedEvent, c: Candidate) -> None:
+        """A repost or roundup names the real organiser: keep it (and the original post) on the market."""
+        org, url = organizer_for(parsed, c)
+        if not org and not url:
+            return
+        with self.db.session() as s:
+            ev = s.get(Event, event_id)
+            if ev is None:
+                return
+            if org and not ev.organizer:
+                ev.organizer = org
+            if url and not ev.organizer_url and (ev.organizer or org):
+                ev.organizer_url = url
 
     # ------------------------------------------------------------ sneak peeks
     def upcoming_event_for(self, account_id: int, now: datetime) -> int | None:
@@ -448,15 +473,28 @@ def _opens_at(value: str | None, tz) -> datetime | None:  # noqa: ANN001
     return dt if dt.tzinfo else dt.replace(tzinfo=tz)
 
 
+def organizer_for(parsed: ParsedEvent, c: Candidate) -> tuple[str | None, str | None]:
+    """(organiser handle, original post URL) when the market is someone else's, else (None, None)."""
+    own = c.account.handle.lower()
+    org = (parsed.organizer or "").strip().lstrip("@").lower() or None
+    if not org and c.reshared_from:
+        org = c.reshared_from.lower()
+    if org == own:
+        org = None
+    return org, (c.shared_post_url if org else None)
+
+
 def new_event_from(parsed: ParsedEvent, c: Candidate, images: list[Path], tz) -> Event:  # noqa: ANN001
     dates = parse_dates(parsed.dates)
+    org, org_url = organizer_for(parsed, c)
     ev = Event(
         account_id=c.account.id,
         title=parsed.title[:300],
         address=parsed.address,
         area=parsed.area,
         region=parsed.region.value,
-        organizer=(parsed.organizer or "").lstrip("@") or None,
+        organizer=org,
+        organizer_url=org_url,
         booking_method=parsed.booking_method.value,
         booking_url=parsed.booking_url,
         booking_opens_at=_opens_at(parsed.booking_opens_at, tz),

@@ -117,8 +117,15 @@ class Briefing:
             lines.append("")
             head = when.strftime("%H:%M") if when else "Any time"
             lines.append(f"<b>{i}. {head} · {escape(ev.title)}</b>")
-            lines.append(f'   <a href="https://www.instagram.com/{escape(handle)}/">@{escape(handle)}</a>'
-                         + (f' · <a href="{escape(ev.source_url)}">post</a>' if ev.source_url else ""))
+            org = T.organizer_of(ev, handle)
+            if org:
+                org_url = ev.organizer_url or f"https://www.instagram.com/{org}/"
+                lines.append(f'   <a href="{escape(org_url)}">@{escape(org)}</a> (via '
+                             f'<a href="{escape(ev.source_url or "https://www.instagram.com/" + handle + "/")}">'
+                             f'@{escape(handle)}</a>)')
+            else:
+                lines.append(f'   <a href="https://www.instagram.com/{escape(handle)}/">@{escape(handle)}</a>'
+                             + (f' · <a href="{escape(ev.source_url)}">post</a>' if ev.source_url else ""))
             if ev.booked_start and ev.booked_start.astimezone(self.tz).date() == day:
                 end = f"–{ev.booked_end.astimezone(self.tz):%H:%M}" if ev.booked_end else ""
                 lines.append(f"   🎟 Your slot {ev.booked_start.astimezone(self.tz):%H:%M}{end}"

@@ -54,7 +54,9 @@ class ParsedEvent(BaseModel):
     address: Optional[str] = Field(None, description="Street address only if stated; never invent")
     area: Optional[str] = Field(None, description="Neighbourhood or town, e.g. 'Chamberí (Almagro)', 'Las Rozas'")
     region: Region
-    organizer: Optional[str] = Field(None, description="Instagram handle of the organizer if named, without @")
+    organizer: Optional[str] = Field(None, description="Instagram handle (no @) of whoever runs the market when it "
+                                                       "isn't the posting account (repost, roundup, 'via @x'); null "
+                                                       "when the account runs it itself")
     booking_method: BookingMethod
     booking_url: Optional[str] = Field(None, description="Only a URL that appears in the text or links")
     booking_opens_at: Optional[str] = Field(None, description="ISO 8601 local datetime when tickets/appointments open, e.g. 2026-11-10T10:00:00")

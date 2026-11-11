@@ -74,6 +74,9 @@ class GeminiParser:
         bio: str | None = None,
         bio_links: list[str] | None = None,
         link_urls: list[str] | None = None,
+        reshared_from: str | None = None,
+        shared_post_url: str | None = None,
+        mentions: list[str] | None = None,
     ) -> ParseResult:
         text = build_user_prompt(
             handle=handle,
@@ -86,6 +89,9 @@ class GeminiParser:
             bio=bio,
             bio_links=bio_links or [],
             link_urls=link_urls or [],
+            reshared_from=reshared_from,
+            shared_post_url=shared_post_url,
+            mentions=mentions or [],
         )
         contents: list[types.Part | str] = [text]
         for img in images[:4]:

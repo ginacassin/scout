@@ -108,7 +108,7 @@ class TelegramNotifier:
             with self.db.session() as s:
                 s.get(Event, event.id).user_decision = "pending"  # ask again
             return
-        text = f"📝 <b>Update</b> — {escape(event.title)} (@{escape(handle)})\n" + "\n".join(
+        text = f"📝 <b>Update</b> — {escape(event.title)} ({T.origin_html(event, handle)})\n" + "\n".join(
             f"• {escape(c)}" for c in changes
         )
         kwargs = {}

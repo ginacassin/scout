@@ -98,6 +98,7 @@ def parse_story(raw: dict[str, Any]) -> StoryItem | None:
             links.append(url)
     if raw.get("story_link_url"):
         links.append(raw["story_link_url"])
+    reshared_from, shared_post_url, mentions = repost_signals(raw, owner)
     return StoryItem(
         story_id=str(sid).split("_")[0],
         owner=owner,
@@ -105,7 +106,34 @@ def parse_story(raw: dict[str, Any]) -> StoryItem | None:
         image_url=image,
         link_urls=list(dict.fromkeys(links)),
         is_video=bool(raw.get("is_video")),
+        reshared_from=reshared_from,
+        shared_post_url=shared_post_url,
+        mentions=mentions,
     )
+
+
+def repost_signals(raw: dict[str, Any], owner: str) -> tuple[str | None, str | None, list[str]]:
+    """Who a story really comes from. Instagram marks a reshared story with a 'mention_reshare'
+    mention of its author, and a reshared post with a story_feed_media sticker whose
+    media_compound_str ends in the post owner's user id (equal to ours when resharing our own post)."""
+    own_id = str((raw.get("owner") or {}).get("id") or (raw.get("user") or {}).get("id") or "")
+    reshared_from, mentions = None, []
+    for m in raw.get("reel_mentions") or []:
+        user = (m.get("user") or {}).get("username", "").lower()
+        if not user or user == owner:
+            continue
+        if m.get("display_type") == "mention_reshare":
+            reshared_from = reshared_from or user
+        elif user not in mentions:
+            mentions.append(user)
+    shared = None
+    for fm in raw.get("story_feed_media") or []:
+        code = fm.get("media_code")
+        post_owner = str(fm.get("media_compound_str") or "").rpartition("_")[2]
+        if code and (not own_id or post_owner != own_id):
+            shared = f"https://www.instagram.com/p/{code}/"
+            break
+    return reshared_from, shared, mentions[:8]
 
 
 class ApifySource(InstagramSource):

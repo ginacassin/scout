@@ -187,11 +187,22 @@ def booking_text(ev: Event, tz) -> str | None:  # noqa: ANN001
     return "Booking: " + "; ".join(parts)
 
 
+def instagram_text(ev: Event, handle: str | None) -> str:
+    """Who runs the market and where it was seen: the organiser first when another account reposted it."""
+    seen = ev.source_url or (f"https://www.instagram.com/{handle}/" if handle else "")
+    org = ev.organizer if ev.organizer and ev.organizer.lower() != (handle or "").lower() else None
+    if not org:
+        return f"📸 Instagram{f' @{handle}' if handle else ''}: {seen}".rstrip(": ")
+    lines = [f"📸 Organiser @{org}: https://www.instagram.com/{org}/"]
+    if ev.organizer_url:
+        lines.append(f"   Their post: {ev.organizer_url}")
+    lines.append(f"🔁 Seen via @{handle}: {seen}" if handle else f"🔁 Seen in: {seen}")
+    return "\n".join(lines)
+
+
 def describe(ev: Event, handle: str | None, tz) -> str:  # noqa: ANN001
     blocks = []
-    ig = ev.source_url or (f"https://www.instagram.com/{handle}/" if handle else None)
-    if ig:
-        blocks.append(f"📸 Instagram{f' @{handle}' if handle else ''}: {ig}")
+    blocks.append(instagram_text(ev, handle))
     if ev.summary:
         blocks.append(ev.summary.strip())
     b = booking_text(ev, tz)
@@ -216,9 +227,7 @@ def notes_text(ev: Event) -> str | None:
 def describe_booked(ev: Event, handle: str | None, tz, eventbrite_url: str | None = None,  # noqa: ANN001
                     ticket: dict[str, Any] | None = None) -> str:
     blocks = []
-    ig = ev.source_url or (f"https://www.instagram.com/{handle}/" if handle else None)
-    if ig:
-        blocks.append(f"📸 Instagram{f' @{handle}' if handle else ''}: {ig}")
+    blocks.append(instagram_text(ev, handle))
     if ev.address:
         blocks.append(f"📍 {ev.address}")
     if ev.booking_method == "eventbrite" or eventbrite_url:

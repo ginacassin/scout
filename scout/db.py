@@ -101,7 +101,8 @@ class Event(Base):
     address: Mapped[str | None] = mapped_column(String(300), nullable=True)
     area: Mapped[str | None] = mapped_column(String(200), nullable=True)
     region: Mapped[str] = mapped_column(String(16), default="unknown")  # madrid | outside | unknown
-    organizer: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    organizer: Mapped[str | None] = mapped_column(String(100), nullable=True)  # handle, when not the poster
+    organizer_url: Mapped[str | None] = mapped_column(String(500), nullable=True)  # their original post
     booking_method: Mapped[str] = mapped_column(String(32), default="unknown")
     booking_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     booking_opens_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
@@ -245,6 +246,16 @@ class Database:
         Base.metadata.create_all(self.engine)
         self._add_missing_columns()
         self._session = sessionmaker(self.engine, expire_on_commit=False)
+        self._drop_self_organizers()
+
+    def _drop_self_organizers(self) -> None:
+        """Older events stored the posting account as its own organiser; it only matters when different."""
+        from sqlalchemy import text
+
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE events SET organizer = NULL WHERE organizer IS NOT NULL AND lower(organizer) = "
+                "(SELECT lower(handle) FROM accounts WHERE accounts.id = events.account_id)"))
 
     def _add_missing_columns(self) -> None:
         """create_all() never alters existing tables: add new nullable/defaulted columns by hand."""

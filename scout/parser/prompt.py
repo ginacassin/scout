@@ -41,6 +41,10 @@ Rules
     A teaser that also shows pieces is still a teaser. A story that is just a photo of a
     chair, lamp, table or similar piece from an account that runs markets is a preview,
     not unrelated.
+- organizer: the Instagram handle of whoever runs the market, without @. Accounts often
+  repost or round up other people's markets (RESHARES lines, "via @x", "organiza @x",
+  a reposted flyer showing another handle): then it is that other account. Use null when
+  the account itself organises it.
 - items_for_sale: whenever the images show actual pieces for an upcoming market (preview,
   teaser, new_event…), name the notable ones briefly in English, most prominent first, at
   most 5. Leave it empty for flyers, pure text, people, recaps of past markets.
@@ -63,6 +67,9 @@ def build_user_prompt(
     bio: str | None,
     bio_links: list[str],
     link_urls: list[str],
+    reshared_from: str | None = None,
+    shared_post_url: str | None = None,
+    mentions: list[str] | None = None,
 ) -> str:
     parts = [
         f"ACCOUNT: @{handle}",
@@ -80,5 +87,11 @@ def build_user_prompt(
         parts.append("PROFILE LINKS: " + ", ".join(bio_links))
     if link_urls:
         parts.append("LINKS IN THIS ITEM: " + ", ".join(link_urls))
+    if reshared_from:
+        parts.append(f"RESHARES A STORY BY: @{reshared_from}")
+    if shared_post_url:
+        parts.append(f"RESHARES SOMEONE ELSE'S POST: {shared_post_url} (its author is usually shown on the image)")
+    if mentions:
+        parts.append("MENTIONS: " + ", ".join("@" + m for m in mentions))
     parts.append("TEXT:\n" + (caption.strip() or "(no caption — read the images)"))
     return "\n".join(parts)

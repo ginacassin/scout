@@ -62,7 +62,7 @@ def event_caption(ev: Event, handle: str, tz: ZoneInfo, header: str | None = Non
     if header:
         lines.append(escape(header))
     lines.append(f"🪑 <b>{escape(ev.title)}</b>")
-    lines.append(f"<i>@{escape(handle)}</i>")
+    lines.append(f"<i>{origin_html(ev, handle)}</i>")
 
     sched = schedule_lines(ev)
     if sched:
@@ -140,9 +140,27 @@ def notes_lines(ev: Event) -> list[str]:
 EXTRA_ANSWERED_BUTTONS: list = []  # list[Callable[[Event], list[InlineKeyboardButton]]]
 
 
+def organizer_of(ev: Event, handle: str | None = None) -> str | None:
+    """The organiser's handle when another account posted the market."""
+    org = (ev.organizer or "").strip().lstrip("@")
+    return org if org and org.lower() != (handle or "").lower() else None
+
+
+def origin_html(ev: Event, handle: str) -> str:
+    org = organizer_of(ev, handle)
+    if org:
+        return f"by @{escape(org)} · via @{escape(handle)}"
+    return f"@{escape(handle)}"
+
+
 def _link_row(ev: Event) -> list[InlineKeyboardButton]:
     row = []
-    if ev.source_url:
+    org = organizer_of(ev)
+    if org:
+        row.append(InlineKeyboardButton(f"📷 @{org}"[:32], url=ev.organizer_url or f"https://www.instagram.com/{org}/"))
+        if ev.source_url:
+            row.append(InlineKeyboardButton("🔁 Repost", url=ev.source_url))
+    elif ev.source_url:
         row.append(InlineKeyboardButton("📷 Instagram", url=ev.source_url))
     if ev.booking_url and ev.booking_url.startswith(("http://", "https://")):
         row.append(InlineKeyboardButton("🎟 Booking", url=ev.booking_url))
@@ -180,7 +198,7 @@ def short_line(ev: Event, handle: str) -> str:
     days = ev.date_list
     when = ", ".join(fmt_day(d) for d in days) if days else "date TBA"
     where = ev.address or ev.area or "place TBA"
-    return f"• <b>{escape(ev.title)}</b> — {escape(when)} — {escape(where)} (@{escape(handle)})"
+    return f"• <b>{escape(ev.title)}</b> — {escape(when)} — {escape(where)} ({origin_html(ev, handle)})"
 
 
 HELP = (
