@@ -3,7 +3,7 @@
 A personal Telegram bot that watches Instagram accounts announcing vintage markets, house-clearance sales and estate sales in Madrid, and alerts you when a new one appears.
 
 - Reads posts, bios and stories through Apify (no Instagram login).
-- Gemini turns each caption and flyer into a structured event: dates, opening sessions, address, booking method, booking opening time.
+- Gemini turns each caption and flyer into a structured event (main model `GEMINI_MODEL`; when it's overloaded or out of free quota, the next free model in `GEMINI_FALLBACK_MODELS` takes the call): dates, opening sessions, address, booking method, booking opening time.
 - Teasers, announcements, reminders and "last day" posts for one market are merged into a single event, so you get one alert.
 - You answer ✅ Interested, 🤔 Maybe or ❌ No; Maybe events notify you again when the date or address is confirmed.
 

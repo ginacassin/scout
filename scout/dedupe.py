@@ -86,17 +86,15 @@ class GeminiTieBreaker:
             system_instruction=TIEBREAK_PROMPT, response_mime_type="application/json",
             response_schema=SameMarketVerdict, temperature=0.0,
         )
-        from .parser.gemini import LIMITER
-        await LIMITER.wait()  # shares the free-tier per-minute budget with the parser
-        t0 = time.perf_counter()
-        STATS.incr("gemini_calls")
-        resp = await self.client.aio.models.generate_content(model=self.model, contents=[text], config=config)
+        from .parser.gemini import generate
+        # Same per-model free-tier budgets and fallback models as the parser; one round only.
+        resp, model, latency = await generate(self.client, self.model, [text], config, {"task": "tiebreak"},
+                                              rounds=1)
         usage = getattr(resp, "usage_metadata", None)
         total = getattr(usage, "total_token_count", None)
         if isinstance(total, int):
             STATS.incr("gemini_tokens", total)
-        log.info("gemini tiebreak %s", kv(model=self.model, latency_ms=int((time.perf_counter() - t0) * 1000),
-                                          total_tokens=total))
+        log.info("gemini tiebreak %s", kv(model=model, latency_ms=latency, total_tokens=total))
         if isinstance(resp.parsed, SameMarketVerdict):
             return resp.parsed
         return SameMarketVerdict.model_validate_json(resp.text or "{}")
