@@ -74,6 +74,12 @@ def main() -> None:
     setup_ticket_hunt(app, settings, db)  # /hunt: watch for released free tickets, only when asked
     setup_peeks(app, settings, db)  # sneak peeks: item photos from stories, ⭐ → note + calendar
 
+    async def refresh_orgs(args: list[str]) -> str:
+        from scout.organizers import refresh_organizers
+        return await refresh_organizers(app, scout, db, args)
+    tasks.register("refresh-organizers", refresh_orgs,
+                   "Find the organiser of reposted markets: refresh-organizers <account> [all]", None, takes_args=True)
+
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
             ("upcoming", "Markets you said yes to"),

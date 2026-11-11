@@ -54,9 +54,10 @@ def tasks_port() -> int:
 @dataclass
 class Task:
     name: str
-    fn: Callable[[], Awaitable[str | None]]
+    fn: Callable[..., Awaitable[str | None]]
     description: str
-    cron: str  # suggested schedule, Europe/Madrid
+    cron: str | None  # suggested schedule, Europe/Madrid; None = run by hand only
+    takes_args: bool = False
 
 
 def parse_daily_cron(expr: str) -> list[time]:
@@ -81,11 +82,12 @@ class TaskRunner:
         self.now = now or (lambda: datetime.now(timezone.utc))
 
     # ------------------------------------------------------------- registry
-    def register(self, name: str, fn: Callable[[], Awaitable[str | None]], description: str, cron: str) -> None:
-        self.tasks[name] = Task(name, fn, description, cron)
+    def register(self, name: str, fn: Callable[..., Awaitable[str | None]], description: str, cron: str | None,
+                 takes_args: bool = False) -> None:
+        self.tasks[name] = Task(name, fn, description, cron, takes_args)
         self._locks[name] = asyncio.Lock()
 
-    async def run(self, name: str, trigger: str = "manual") -> tuple[bool, str]:
+    async def run(self, name: str, trigger: str = "manual", args: list[str] | None = None) -> tuple[bool, str]:
         task = self.tasks.get(name)
         if task is None:
             return False, f"unknown task {name!r}; known: {', '.join(sorted(self.tasks))}"
@@ -95,7 +97,7 @@ class TaskRunner:
         async with lock:
             try:
                 async with obs.trace(f"task {name}", trigger=trigger):
-                    summary = await task.fn()
+                    summary = await (task.fn(list(args or [])) if task.takes_args else task.fn())
             except Exception as exc:  # noqa: BLE001 - reported to the caller (Dokploy shows it)
                 log.exception("Task %s failed", name)
                 return False, f"{type(exc).__name__}: {exc}"
@@ -119,10 +121,11 @@ class TaskRunner:
                 resp = {"ok": False, "summary": "bad token"}
             elif req.get("task") == "list":
                 resp = {"ok": True, "tasks": [
-                    {"name": t.name, "cron": t.cron, "description": t.description,
+                    {"name": t.name, "cron": t.cron or "(by hand)", "description": t.description,
                      "last_run": (self.last_run(t.name) or "never").__str__()} for t in self.tasks.values()]}
             else:
-                ok, summary = await self.run(str(req.get("task")), trigger="cron")
+                ok, summary = await self.run(str(req.get("task")), trigger="cron",
+                                             args=[str(a) for a in req.get("args") or []])
                 resp = {"ok": ok, "summary": summary}
             writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode())
             await writer.drain()
@@ -139,7 +142,7 @@ class TaskRunner:
             return
         if self.mode == "internal":
             for task in self.tasks.values():
-                for t in parse_daily_cron(task.cron):
+                for t in (parse_daily_cron(task.cron) if task.cron else []):
                     jq.run_daily(self._job, t.replace(tzinfo=self.settings.tz), name=f"task-{task.name}-{t:%H%M}",
                                  data=task.name)
         else:
