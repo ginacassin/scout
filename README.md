@@ -99,7 +99,7 @@ as history.
 ## Schedule (Europe/Madrid)
 
 - Posts and bios: 08:02, 11:02, 14:02, 17:02, 20:02, 23:02 (`POLL_HOURS`)
-- Stories: 13:00 and 21:00 daily (stories live 24 h, so two reads 12 h apart catch every one); also on `/add` for the new account, and once after a restart if the last read is over 12 h old
+- Stories: 13:00 and 21:00 daily (stories live 24 h, so two reads 8 and 16 h apart catch every one); also on `/add` for the new account, and once after a restart if the last read is over 12 h old
 - Upkeep: 04:00 (past events, image pruning, retention cleanup)
 - Morning briefing: 08:00 on days with ✅/booked markets (`BRIEFING_TIME`): time order, Instagram account, what's on sale, hours, address, notes, drive times, one Maps route
 - Reminder 1 h before a booked slot
