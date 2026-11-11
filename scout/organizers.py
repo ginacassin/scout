@@ -3,7 +3,8 @@
     python -m scout.cron refresh-organizers mercadillosmad      # that account's markets on your calendar
     python -m scout.cron refresh-organizers mercadillosmad all  # …including 🤔 and unanswered ones
 
-Each market's saved Instagram items (caption + images, kept 30 days) are read again with the current
+Markets whose organiser was already known just get their card and calendar entry redrawn. For the
+rest, each market's saved Instagram items (caption + images, kept 30 days) are read again with the current
 instructions; the first organiser named that isn't the posting account is stored. The card is edited
 in place and the calendar entry re-synced silently — no new messages.
 """
@@ -30,7 +31,7 @@ async def refresh_organizers(app, scout, db: Database, args: list[str]) -> str: 
     with db.session() as s:
         accounts = {a.id: a for a in s.scalars(select(Account))}
         events = [e for e in s.scalars(select(Event).where(Event.user_decision.in_(decisions),
-                                                           Event.status != "past", Event.organizer.is_(None)))
+                                                           Event.status != "past"))
                   if not handles or accounts[e.account_id].handle.lower() in handles]
         items = list(s.scalars(select(SourceItem).where(SourceItem.parsed_json.is_not(None))
                                .order_by(SourceItem.posted_at)))
@@ -40,6 +41,12 @@ async def refresh_organizers(app, scout, db: Database, args: list[str]) -> str: 
     tz = scout.settings.tz
     for ev in events:
         own = accounts[ev.account_id].handle.lower()
+        if ev.organizer and ev.organizer.lower() != own:
+            # Known from the first parse, but cards and calendar were drawn before organisers were shown.
+            lines.append(f"#{ev.id} {ev.title}: by @{ev.organizer} · via @{own} (already known, refreshed)")
+            found += 1
+            await redraw(app, db, ev.id)
+            continue
         mine = [i for i in items if ev.id in json.loads(i.event_ids or "[]")][-MAX_ITEMS:]
         org = None
         for item in mine:

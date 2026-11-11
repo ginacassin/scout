@@ -31,7 +31,9 @@ async def test_refresh_sets_organizer_only_where_someone_else_runs_it(tmp_path):
         e2 = Event(account_id=mm.id, title="Own", dates="[]", user_decision="yes", status="announced")
         e3 = Event(account_id=mm.id, title="Merged", dates="[]", user_decision="yes", status="announced")
         e4 = Event(account_id=mm.id, title="Not on calendar", dates="[]", user_decision="maybe", status="announced")
-        s.add_all([e1, e2, e3, e4])
+        e5 = Event(account_id=mm.id, title="Known", dates="[]", user_decision="yes", status="announced",
+                   organizer="recumadrid")
+        s.add_all([e1, e2, e3, e4, e5])
         s.flush()
         s.add(SourceItem(account_id=mm.id, ig_id="story:1", kind="story", caption="flyer by @lacasadelaabuela",
                          parsed_json="{}", event_ids=json.dumps([e1.id])))
@@ -44,7 +46,8 @@ async def test_refresh_sets_organizer_only_where_someone_else_runs_it(tmp_path):
     scout = SimpleNamespace(parser=parser, settings=SimpleNamespace(tz=ZoneInfo("Europe/Madrid")))
     app = SimpleNamespace(bot_data={})
     out = await refresh_organizers(app, scout, db, ["mercadillosmad"])
-    assert out.startswith("2 of 3 markets updated")
+    assert out.startswith("3 of 4 markets updated")
+    assert "Known: by @recumadrid · via @mercadillosmad (already known, refreshed)" in out
     with db.session() as s:
         assert [s.get(Event, i).organizer for i in ids] == ["lacasadelaabuela", None, "almamarket_home", None]
     assert "alma's own post" not in parser.calls  # decided from its own parse, no Gemini call
