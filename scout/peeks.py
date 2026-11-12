@@ -25,7 +25,7 @@ from typing import Any
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message, ReplyParameters, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.ext.filters import MessageFilter
 
@@ -35,7 +35,8 @@ from .db import Account, Database, Event, Peek, utcnow
 log = logging.getLogger(__name__)
 
 ALBUM = 10  # Telegram's media-group limit
-QUIET = timedelta(minutes=3)  # wait until the account stops posting before sending
+QUIET = timedelta(minutes=3)
+UPLOAD_TIMEOUT = 60  # seconds; photo uploads from the Pi can be slow  # wait until the account stops posting before sending
 ADOPT_DAYS = 21  # photos posted before the market was announced
 
 
@@ -159,15 +160,22 @@ class Peeks:
             if len(usable) == 1:
                 p = usable[0]
                 msgs = [await bot.send_photo(self.chat_id, Path(p.image_path).read_bytes(),
-                                             caption=_caption(1, p.item_list), disable_notification=True, **reply)]
+                                             caption=_caption(1, p.item_list), disable_notification=True,
+                                             write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT, **reply)]
             else:
                 media = [InputMediaPhoto(Path(p.image_path).read_bytes(), caption=_caption(i, p.item_list))
                          for i, p in enumerate(usable, 1)]
-                msgs = list(await bot.send_media_group(self.chat_id, media, disable_notification=True, **reply))
+                msgs = list(await bot.send_media_group(self.chat_id, media, disable_notification=True,
+                                                       write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT,
+                                                       **reply))
         except BadRequest as exc:
             # A broken image would fail forever: send the album without it next time.
             log.warning("Sneak peek album for event %s refused (%s); dropping it", event_id, exc)
             self._set_state([p.id for p in usable], "sent")
+            return 0
+        except TimedOut:
+            # Slow upload from the Pi: the photos stay queued and the next round (90 s) sends them.
+            log.warning("Sneak peek upload for event %s timed out; retrying next round", event_id)
             return 0
         except TelegramError:
             log.exception("Couldn't send sneak peek album for event %s", event_id)

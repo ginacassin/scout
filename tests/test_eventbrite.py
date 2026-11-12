@@ -518,3 +518,22 @@ async def test_toggle_buttons_and_bookings_list(wenv):
     text = w.bookings_text()
     assert "Mercadillo Clara del Rey" in text and "Tue 10 Nov 10:00" in text and "🔕 off" in text
     assert "not open yet" in text
+
+
+async def test_rejected_candidates_logged_once(caplog):
+    import logging
+    from datetime import date as _d, datetime as _dt, timezone as _tz
+    from scout.eventbrite.resolver import EBEvent, Resolver
+
+    r = Resolver(client=None)
+
+    async def expand(link, depth):
+        return [EBEvent(id="1991930752502", url=link, name="Other market",
+                        start=_dt(2026, 10, 1, 9, tzinfo=_tz.utc), end=_dt(2026, 10, 1, 14, tzinfo=_tz.utc))]
+
+    r._expand = expand
+    dates = [_d(2026, 11, 20), _d(2026, 11, 21)]
+    with caplog.at_level(logging.INFO, logger="scout.eventbrite.resolver"):
+        for _ in range(3):
+            assert await r._resolve(dates, ["https://www.eventbrite.es/e/1991930752502"]) is None
+    assert sum("don't match dates" in m for m in caplog.messages) == 1

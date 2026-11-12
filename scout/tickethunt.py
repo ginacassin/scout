@@ -171,7 +171,9 @@ class TicketHunt:
         else:
             status = "sold out" if not any(s.available for s in slots) else "nothing fits"
         self._update(event_id, hunt_avail=json.dumps(keys), hunt_checked_at=self.now(), hunt_status=status[:200])
-        log.info("ticket hunt event=%s slots=%d matching=%d new=%d", event_id, len(slots), len(found), len(new))
+        changed = new or status[:200] != (w.hunt_status or "")
+        log.log(logging.INFO if changed else logging.DEBUG, "ticket hunt event=%s slots=%d matching=%d new=%d status=%r",
+                event_id, len(slots), len(found), len(new), status)
         if new:
             await self._alert(ev, w, new, found)
         return status, found, slots

@@ -115,6 +115,7 @@ def overlaps(cand: EBEvent, dates: list[date]) -> bool | None:
 class Resolver:
     def __init__(self, client: EventbriteClient):
         self.client = client
+        self._rejected: set[tuple] = set()  # (candidate ids, dates) already reported: log each once
 
     async def resolve(self, dates: list[date], booking_url: str | None, bio_links: list[str]) -> Resolved | None:
         try:
@@ -154,7 +155,11 @@ class Resolver:
         else:
             unknown = [c for c in cands if overlaps(c, dates) is None]
             if not unknown:
-                log.info("Eventbrite candidates %s don't match dates %s", [c.id for c in cands], dates)
+                key = (tuple(sorted(c.id for c in cands)), tuple(dates))
+                level = logging.DEBUG if key in self._rejected else logging.INFO
+                self._rejected.add(key)
+                log.log(level, "Eventbrite candidates %s don't match dates %s (logged once)",
+                        [c.id for c in cands], [d.isoformat() for d in dates])
                 return None
             best = unknown[0]  # first link (post's own, then bio) when dates can't be checked
         return Resolved(best.id, canonical_event_url(best.id, best.url))

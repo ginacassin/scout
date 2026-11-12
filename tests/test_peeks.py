@@ -196,3 +196,18 @@ def test_pipeline_links_item_photos_to_next_market(world, tmp_path):  # noqa: F8
     with db.session() as s:
         p = s.query(Peek).one()
         assert s.get(Event, p.event_id).title == "Sooner" and p.item_list == ["oak table"]
+
+
+async def test_upload_timeout_keeps_photos_queued(penv):
+    from telegram.error import TimedOut
+    peeks, db, app, clock, tmp, (acc, ev) = penv
+    add_peeks(db, tmp, acc, ev, 1, clock.t - timedelta(minutes=10))
+
+    async def slow(*a, **kw):
+        assert kw["write_timeout"] == 60
+        raise TimedOut()
+
+    app.bot.send_photo = slow
+    assert await peeks.tick() == 0
+    with db.session() as s:
+        assert s.query(Peek).one().state == "new"  # sent on the next round
