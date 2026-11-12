@@ -55,6 +55,7 @@ def main() -> None:
     app = Application.builder().token(settings.bot_token).build()
     tasks = setup_tasks(app, settings, db)  # recurring jobs, run by Dokploy Schedules (python -m scout.cron …)
     notifier = TelegramNotifier(app, db, settings.allowed_chat_id, settings.tz)
+    app.bot_data["notifier"] = notifier
     scout = Scout(settings, db, build_source(settings), GeminiParser(settings.gemini_api_key, settings.gemini_model), notifier)
     BotHandlers(scout, db, notifier, settings).register(app)
     setup_booking_watcher(app, settings, db)  # M3: Eventbrite booking pings, /bookings

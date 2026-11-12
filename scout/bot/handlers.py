@@ -12,7 +12,7 @@ from pathlib import Path
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 
 from .. import hooks, obs
-from ..db import Account, Database, Event
+from ..db import Account, Database, Event, utcnow
 from ..media import prune_media
 from ..pipeline import STORIES_AT_KEY
 from . import templates as T
@@ -71,14 +71,17 @@ class TelegramNotifier:
         bot = self.app.bot
         try:
             if ev.media_path and Path(ev.media_path).exists():
-                with open(ev.media_path, "rb") as f:
-                    msg = await bot.send_photo(self.chat_id, f, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+                msg = await bot.send_photo(self.chat_id, Path(ev.media_path).read_bytes(), caption=caption,
+                                           parse_mode=ParseMode.HTML, reply_markup=kb,
+                                           write_timeout=UPLOAD_TIMEOUT, read_timeout=UPLOAD_TIMEOUT)
             else:
                 msg = await bot.send_message(self.chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=kb,
                                              disable_web_page_preview=True)
-        except BadRequest:
-            log.exception("Sending card for event %s failed; retrying without photo", ev.id)
-            msg = await bot.send_message(self.chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except (BadRequest, TimedOut, NetworkError) as exc:
+            # The flyer didn't make it (refused, or a slow upload from the Pi): the alert matters more.
+            log.warning("Card for event %s sent without its image (%s: %s)", ev.id, type(exc).__name__, exc)
+            msg = await bot.send_message(self.chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                         disable_web_page_preview=True)
         with self.db.session() as s:
             row = s.get(Event, ev.id)
             row.telegram_message_id = msg.message_id
@@ -95,7 +98,7 @@ class TelegramNotifier:
         try:
             await self.send_event_card(event, header=header)
         except TelegramError:
-            log.exception("Could not send event %s; it will be sent on /start or /resume", event.id)
+            log.exception("Could not send event %s; retrying within 5 minutes", event.id)
 
     async def event_update(self, event: Event, changes: list[str]) -> None:
         if self.paused:
@@ -134,14 +137,39 @@ class TelegramNotifier:
         except TelegramError:
             log.exception("Could not send warning: %s", text)
 
-    async def send_unsent(self, header: str) -> int:
-        """Cards found while alerts were paused or before the chat was opened."""
+    def unsent(self, older_than: timedelta | None = None) -> list[Event]:
         with self.db.session() as s:
             pending = list(s.scalars(select(Event).where(
                 Event.user_decision == "pending", Event.telegram_message_id.is_(None), Event.status != "past")))
-        for ev in sorted(pending, key=lambda e: e.created_at):
+        if older_than is not None:
+            cutoff = utcnow() - older_than
+            pending = [e for e in pending if e.created_at and e.created_at < cutoff]
+        return sorted(pending, key=lambda e: e.created_at)
+
+    async def send_unsent(self, header: str) -> int:
+        """Cards found while alerts were paused or before the chat was opened."""
+        pending = self.unsent()
+        for ev in pending:
             await self.send_event_card(ev, header=header)
         return len(pending)
+
+    async def redeliver(self, ctx: ContextTypes.DEFAULT_TYPE | None = None) -> int:
+        """Every few minutes: cards that failed to send (Telegram unreachable, timeouts) go out late
+        instead of waiting for /start. Not while alerts are paused."""
+        if self.paused:
+            return 0
+        sent = 0
+        for ev in self.unsent(older_than=timedelta(minutes=2)):
+            header = "👀 Teaser: something's coming" if not ev.date_list else "🆕 New market"
+            try:
+                await self.send_event_card(ev, header=header)
+                sent += 1
+            except TelegramError as exc:
+                log.warning("Redelivery of event %s failed (%s); next try in 5 minutes", ev.id, exc)
+                break  # Telegram is still unreachable: don't hammer it
+        if sent:
+            log.info("redelivered %d card(s)", sent)
+        return sent
 
 
 EVENTS_PAGE_SIZE = 8
@@ -154,6 +182,7 @@ EVENT_FILTER_TITLES = {
     "out": "Outside Madrid", "past": "Past",
 }
 # BadRequest texts after which a card can't be edited in place, so a fresh one is sent.
+UPLOAD_TIMEOUT = 60  # seconds; uploads from the Pi can be slow
 UNEDITABLE = ("there is no caption in the message to edit", "there is no text in the message to edit",
               "message can't be edited", "message to edit not found")
 
@@ -353,10 +382,20 @@ class BotHandlers:
         lines = [
             "<b>Scout status</b>",
             f"Accounts: {len(accounts)}",
-            f"Last successful check: {last.astimezone(tz):%a %-d %b %H:%M}" if last else "Last successful check: none yet",
-            "Checks: posts and bio at " + ", ".join(f"{h:02d}:00" for h in self.settings.poll_hours) + "; stories at " + " and ".join(f"{h:02d}:00" for h in STORY_HOURS),
-            "Alerts: paused" if self.notifier.paused else "Alerts: on",
         ]
+        tasks = ctx.application.bot_data.get("tasks") if ctx is not None and ctx.application else None
+        fmt = lambda d: d.astimezone(tz).strftime("%a %-d %b %H:%M") if d else "never"  # noqa: E731
+        if tasks is not None:
+            lines.append(f"Last checks: posts {fmt(tasks.last_run('check-posts') or last)} · "
+                         f"stories {fmt(tasks.last_run('check-stories'))}")
+            lines.append("Schedules: Dokploy → scout-bot → Schedules" if tasks.mode == "dokploy" else
+                         "Schedules: inside the bot (SCHEDULER=internal)")
+        else:
+            lines.append(f"Last successful check: {fmt(last)}")
+        lines.append("Alerts: paused" if self.notifier.paused else "Alerts: on")
+        waiting = self.notifier.unsent()
+        if waiting and not self.notifier.paused:
+            lines.append(f"⚠️ {len(waiting)} new market card(s) not delivered yet — retried every 5 min")
         if spend:
             used, cap = spend
             lines.append(f"Apify this month: ${used:.2f}" + (f" of ${cap:.2f}" if cap else ""))
@@ -644,6 +683,9 @@ def schedule_jobs(app: Application, scout, settings, db: Database) -> None:  # n
             log.info("Startup: merged %d duplicate events", n)
 
     jq.run_once(dedupe_once, when=timedelta(seconds=3), name="startup-dedupe")
+    notifier = app.bot_data.get("notifier")
+    if notifier is not None:
+        jq.run_repeating(notifier.redeliver, interval=300, first=120, name="redeliver-cards")
 
     # First run after a fresh install, or if the last good poll is older than 3 h.
     beat = settings.heartbeat_file
