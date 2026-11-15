@@ -64,3 +64,67 @@ async def test_repair_rebuilds_hours_wiped_by_a_story():
         assert ev.booking_url == "https://www.eventbrite.es/e/1"
         assert "Gacela" in ev.address
     assert (await repair_sessions(SimpleNamespace(bot_data={}), db, [])).startswith("0 of 1")
+
+
+def roundup(*markets):
+    evs = []
+    for title, address, start in markets:
+        evs.append({"title": title, "dates": [SAT], "sessions": [sess(SAT, start, "14:00")], "address": address,
+                    "region": "madrid", "booking_method": "free_entry", "booking_status": "unknown",
+                    "link_in_bio": False, "summary_en": "x", "confidence": 0.9})
+    return json.dumps({"kind": "new_event", "events": evs})
+
+
+async def test_roundup_gives_each_market_only_its_own_details(tmp_path):
+    db = Database(":memory:")
+    with db.session() as s:
+        acc = Account(handle="mercadillosmad")
+        s.add(acc)
+        s.flush()
+        ids = []
+        for title in ("Mercadillo en casa Arturo Soria", "El Déballage de La Moraleja"):
+            ev = Event(account_id=acc.id, title=title, dates="[]", status="announced", user_decision="pending")
+            ev.date_list = [date(2026, 11, 21)]
+            ev.session_list = [sess(SAT)]
+            s.add(ev)
+            s.flush()
+            ids.append(ev.id)
+        s.add(SourceItem(account_id=acc.id, ig_id="post:r", kind="post", caption="",
+                         parsed_json=roundup(("Mercadillo en casa Arturo Soria", "Caribe 5 y 7", "10:00"),
+                                             ("El Déballage de La Moraleja", "C.C. El Bulevar", "11:00")),
+                         event_ids=json.dumps(sorted(ids))))
+    await repair_sessions(SimpleNamespace(bot_data={}), db, [])
+    with db.session() as s:
+        a, b = (s.get(Event, i) for i in ids)
+        assert "Caribe" in a.address and a.session_list[0]["start"] == "10:00"
+        assert "Bulevar" in b.address and b.session_list[0]["start"] == "11:00"
+
+
+async def test_repair_from_an_older_copy(tmp_path):
+    import sqlite3
+    old = tmp_path / "old.db"
+    con = sqlite3.connect(old)
+    con.execute("create table events (id integer, sessions text, address text, booking_url text)")
+    con.execute("insert into events values (1, ?, 'Serrano 1', null)", (json.dumps([sess(SAT, "09:00", "13:00")]),))
+    con.commit()
+    con.close()
+    db = Database(":memory:")
+    with db.session() as s:
+        acc = Account(handle="m")
+        s.add(acc)
+        s.flush()
+        ev = Event(id=1, account_id=acc.id, title="Market", dates="[]", status="announced", address="Wrong 5")
+        ev.date_list = [date(2026, 11, 21)]
+        ev.session_list = [sess(SAT, "18:00", "20:00")]
+        s.add(ev)
+        s.add(SourceItem(account_id=acc.id, ig_id="story:x", kind="story", caption="",
+                         parsed_json=parsed([sess(SAT)]), event_ids="[1]"))
+    dry = await repair_sessions(SimpleNamespace(bot_data={}), db, [f"--from={old}", "--dry-run"])
+    assert dry.startswith("1 of 1 markets would change") and "Serrano 1" in dry
+    with db.session() as s:
+        assert s.get(Event, 1).address == "Wrong 5"
+    out = await repair_sessions(SimpleNamespace(bot_data={}), db, [f"--from={old}"])
+    assert out.startswith("1 of 1")
+    with db.session() as s:
+        ev = s.get(Event, 1)
+        assert ev.address == "Serrano 1" and ev.session_list == [sess(SAT, "09:00", "13:00")]
