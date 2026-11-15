@@ -81,6 +81,13 @@ def main() -> None:
     tasks.register("refresh-organizers", refresh_orgs,
                    "Find the organiser of reposted markets: refresh-organizers <account> [all]", None, takes_args=True)
 
+    async def repair(args: list[str]) -> str:
+        from scout.repair import repair_sessions
+        return await repair_sessions(app, db, args)
+    tasks.register("repair-sessions", repair,
+                   "Rebuild upcoming markets' hours/address/link from all saved posts: repair-sessions [ids]",
+                   None, takes_args=True)
+
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands([
             ("upcoming", "Markets you said yes to"),

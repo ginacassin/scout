@@ -85,6 +85,10 @@ class AdminTools:
 
     async def on_event_updated(self, event_id: int, changes: list[str] | None = None, **_) -> None:  # noqa: ANN003
         header = "🔄 Updated: " + "; ".join(changes) if changes else "🔄 Updated"
+        ev, _h = self._load(event_id)
+        if ev is not None and ev.user_decision not in ("pending",):
+            await self.refresh_answered_card(event_id)  # ✅/🤔 cards show the new hours and address too
+            return
         await self.refresh_pending_card(event_id, header)
 
     async def on_events_merged(self, event_id: int, merged_id: int | None = None, **_) -> None:  # noqa: ANN003
@@ -97,6 +101,14 @@ class AdminTools:
                         f"<s>{escape(dup.title)}</s> <i>@{escape(handle)}</i>")
                 await self._edit(dup.telegram_message_id, text, None)
         await self.refresh_pending_card(event_id, None)
+
+    async def refresh_answered_card(self, event_id: int) -> bool:
+        """Redraw an answered card in place with the current details (no new message)."""
+        ev, handle = self._load(event_id)
+        if ev is None or not ev.telegram_message_id or ev.status == "past":
+            return False
+        await self._edit(ev.telegram_message_id, T.event_caption(ev, handle, self.tz), T.answered_keyboard(ev))
+        return True
 
     # ---------------------------------------------------------------- /merge
     async def cmd_merge(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

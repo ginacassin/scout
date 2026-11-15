@@ -155,7 +155,14 @@ def classes(*statuses, start="2026-11-10T09:00:00Z"):
                                 "sales_end": "2026-11-13T08:00:00Z"} for s in statuses]}
 
 
-async def test_api_not_yet_on_sale():
+@pytest.fixture
+def nov10(monkeypatch):
+    """These fixtures describe markets on 13 Nov 2026, seen from 10 Nov."""
+    import scout.eventbrite.client as client_mod
+    monkeypatch.setattr(client_mod, "_now", lambda: datetime(2026, 11, 10, 12, tzinfo=timezone.utc))
+
+
+async def test_api_not_yet_on_sale(nov10):
     r = Router()
     r.add(f"{API}/events/9/", api_event())
     r.add(f"{API}/events/9/ticket_classes/", classes("NOT_YET_ON_SALE"))
@@ -164,7 +171,7 @@ async def test_api_not_yet_on_sale():
     assert st.sales_start == mad(11, 10, 10)
 
 
-async def test_api_available_and_sold_out_trust_ticket_classes():
+async def test_api_available_and_sold_out_trust_ticket_classes(nov10):
     r = Router()
     r.add(f"{API}/events/9/", api_event("on_sale", has_available=True))
     r.add(f"{API}/events/9/ticket_classes/", classes("AVAILABLE"))
@@ -174,7 +181,7 @@ async def test_api_available_and_sold_out_trust_ticket_classes():
     assert (await make_client(r, "tok").status("9")).state == "sold_out"
 
 
-async def test_jsonld_fallback_states():
+async def test_jsonld_fallback_states(nov10):
     url = "https://www.eventbrite.es/e/x-9"
     for avail, want in (("PreOrder", "not_open"), ("InStock", "open"), ("SoldOut", "sold_out")):
         r = Router()
@@ -185,7 +192,7 @@ async def test_jsonld_fallback_states():
         assert st.sales_start == mad(11, 10, 10)
 
 
-async def test_api_403_falls_back_to_page():
+async def test_api_403_falls_back_to_page(nov10):
     url = "https://www.eventbrite.es/e/x-9"
     r = Router()
     r.add(f"{API}/events/9/", httpx.Response(403))

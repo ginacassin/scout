@@ -535,11 +535,15 @@ def merge_into(ev: Event, parsed: ParsedEvent, kind: ItemKind, tz) -> MergeOutco
             # same detail, fuller wording: stored silently
     if parsed.area and not ev.area:
         ev.area = parsed.area
-    if parsed.sessions and parsed.sessions != [] and json_sessions(parsed) != ev.sessions:
-        had = bool(ev.session_list)
-        ev.session_list = [sess.model_dump() for sess in parsed.sessions]
-        if had and kind == ItemKind.update:
-            out.changes.append("opening hours updated")
+    if parsed.sessions:
+        old = ev.session_list
+        merged = merge_sessions(old, [sess.model_dump() for sess in parsed.sessions])
+        if merged != old:
+            ev.session_list = merged
+            if timed(old) and timed(merged) != timed(old):
+                out.changes.append("opening hours updated")
+            elif timed(merged) and not timed(old) and old:
+                out.changes.append("opening hours announced")
     if parsed.booking_method.value not in ("unknown",) and ev.booking_method in ("unknown", "free_entry") and parsed.booking_method.value != ev.booking_method:
         ev.booking_method = parsed.booking_method.value
         out.changes.append(f"booking: {parsed.booking_method.value.replace('_', ' ')}")
@@ -567,6 +571,35 @@ def merge_into(ev: Event, parsed: ParsedEvent, kind: ItemKind, tz) -> MergeOutco
     for ch in out.changes:
         ev.log_change(ch)
     return out
+
+
+def timed(sessions: list[dict]) -> list[tuple]:
+    """The parts of the opening hours that carry times."""
+    return sorted((x.get("date") or "", x.get("start") or "", x.get("end") or "") for x in sessions
+                  if x.get("start") or x.get("end"))
+
+
+def merge_sessions(old: list[dict], new: list[dict]) -> list[dict]:
+    """Day by day, keep the most detailed opening hours: a later item that mentions the market without
+    times (a reminder story, a teaser) never wipes out hours an earlier post gave. A day whose new
+    sessions carry times takes them (newer hours win); days only in one list are kept as they are."""
+    def by_day(items: list[dict]) -> dict[str, list[dict]]:
+        out: dict[str, list[dict]] = {}
+        for x in items:
+            out.setdefault(x.get("date") or "", []).append(x)
+        return out
+
+    o, n = by_day(old), by_day(new)
+    result: list[dict] = []
+    for day in sorted(set(o) | set(n)):
+        old_d, new_d = o.get(day, []), n.get(day, [])
+        if new_d and timed(new_d):
+            result += new_d
+        elif old_d and timed(old_d):
+            result += old_d
+        else:
+            result += new_d or old_d
+    return sorted(result, key=lambda x: (x.get("date") or "", x.get("start") or ""))
 
 
 def json_sessions(parsed: ParsedEvent) -> str:

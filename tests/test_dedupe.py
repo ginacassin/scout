@@ -330,7 +330,7 @@ async def test_update_edits_pending_card_in_place(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_text_card_fallback_and_answered_cards_untouched(tmp_path):
+async def test_text_card_fallback_and_answered_cards_refreshed(tmp_path):
     scout, db, _ = make_world(tmp_path)
     bot = fake_bot()
     bot.edit_message_caption.side_effect = BadRequest("Bad Request: there is no caption in the message to edit")
@@ -344,7 +344,8 @@ async def test_text_card_fallback_and_answered_cards_untouched(tmp_path):
     assert bot.edit_message_text.await_args.kwargs["message_id"] == 10
     bot.edit_message_text.reset_mock()
     await tools.on_event_updated(yes, changes=["address: X"])
-    bot.edit_message_text.assert_not_awaited()
+    # Answered cards are redrawn too (new hours/address from a later post), keeping their buttons.
+    assert bot.edit_message_text.await_args.kwargs["message_id"] == 11
 
 
 @pytest.mark.asyncio

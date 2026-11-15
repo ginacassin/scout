@@ -136,8 +136,13 @@ def _price_zero(o: dict) -> bool | None:
     return None
 
 
+def _now() -> datetime:
+    """The current time (a function so tests can pin it)."""
+    return datetime.now(timezone.utc)
+
+
 def status_from_ld(ev: dict, url: str | None, now: datetime | None = None) -> TicketStatus:
-    now = now or datetime.now(timezone.utc)
+    now = now or _now()
     offers = _offers(ev)
     avail = [str(o.get("availability") or "").rsplit("/", 1)[-1].lower() for o in offers]
     valid_from = [d for d in (parse_dt(o.get("validFrom")) for o in offers) if d]
@@ -171,7 +176,7 @@ def status_from_ld(ev: dict, url: str | None, now: datetime | None = None) -> Ti
 
 
 def status_from_api(event: dict, classes: list[dict] | None, now: datetime | None = None) -> TicketStatus:
-    now = now or datetime.now(timezone.utc)
+    now = now or _now()
     url = event.get("url")
     start = parse_dt(event.get("start"))
     end = parse_dt(event.get("end"))
