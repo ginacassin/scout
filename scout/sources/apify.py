@@ -136,6 +136,12 @@ def repost_signals(raw: dict[str, Any], owner: str) -> tuple[str | None, str | N
     return reshared_from, shared, mentions[:8]
 
 
+# Apify caps a pay-per-result run at max_items × the price per result, and refuses runs whose cap is
+# under its minimum charge (~$0.0027): one profile (/add @x) is ~$0.0023. Only results actually
+# returned are paid for, so a floor costs nothing extra.
+MIN_ITEMS = 5
+
+
 class ApifySource(InstagramSource):
     def __init__(self, token: str):
         self.client = ApifyClientAsync(token)
@@ -146,7 +152,7 @@ class ApifySource(InstagramSource):
         try:
             run = await self.client.actor(actor).call(
                 run_input=run_input,
-                max_items=max_items,
+                max_items=max(max_items, MIN_ITEMS),
                 run_timeout=timedelta(minutes=10),
                 logger=None,
             )
