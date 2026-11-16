@@ -332,3 +332,12 @@ async def test_service_account_tokens_via_token_endpoint():
 
 def test_setup_disabled_without_config():
     assert setup_calendar(FakeApp(), make_settings(gcal_calendar_id=""), Database(":memory:")) is None
+
+
+def test_patch_switching_all_day_and_timed_clears_the_other_form():
+    from scout.gcal import patch_body
+    timed = patch_body({"summary": "x", "start": {"dateTime": "2026-11-22T11:00:00", "timeZone": "Europe/Madrid"},
+                        "end": {"dateTime": "2026-11-22T19:00:00", "timeZone": "Europe/Madrid"}})
+    assert timed["start"] == {"dateTime": "2026-11-22T11:00:00", "timeZone": "Europe/Madrid", "date": None}
+    allday = patch_body({"start": {"date": "2026-11-22"}, "end": {"date": "2026-11-23"}})
+    assert allday["start"] == {"date": "2026-11-22", "dateTime": None, "timeZone": None}

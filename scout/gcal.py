@@ -287,6 +287,18 @@ def _hm(value: str | None) -> tuple[int, int] | None:
         return None
 
 
+def patch_body(body: dict[str, Any]) -> dict[str, Any]:
+    """A PATCH merges start/end with what the entry has, so an all-day entry that gets hours (or the
+    reverse) would hold both "date" and "dateTime" → 400 Invalid start time. Clear the other one."""
+    out = dict(body)
+    for k in ("start", "end"):
+        t = body.get(k)
+        if not t:
+            continue
+        out[k] = {**t, "date": None} if "dateTime" in t else {**t, "dateTime": None, "timeZone": None}
+    return out
+
+
 def desired_events(ev: Event, handle: str | None, tz, now: datetime,  # noqa: ANN001
                    attachments: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
     """key -> Calendar API event body. Keys are stable so patches hit the right calendar entry."""
@@ -444,7 +456,7 @@ class CalendarSync:
         return await self._call("POST", self._events_url, json=body, params=self._params(body))
 
     async def _patch(self, gid: str, body: dict[str, Any]) -> dict[str, Any]:
-        return await self._call("PATCH", f"{self._events_url}/{quote(gid, safe='')}", json=body,
+        return await self._call("PATCH", f"{self._events_url}/{quote(gid, safe='')}", json=patch_body(body),
                                 params=self._params(body))
 
     async def _delete(self, gid: str) -> None:
