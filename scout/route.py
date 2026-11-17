@@ -1,29 +1,39 @@
-"""Day route planner (/route): the order to visit every market on your calendar for a day, by car.
+"""Day route planner (/route): the order to visit every market on your calendar for a day, by car,
+and a live mode on the day that tells you when to leave and re-plans when you stay longer.
 
 What goes in, for the chosen day:
-* Booked slots (Event.booked_start) are fixed: you arrive by the slot time and stay VISIT_MINUTES or
-  until the slot ends, whichever is later. Their order is the order of the slots.
+* Booked slots (Event.booked_start) are fixed: you must be there QUEUE_MINUTES (15) before the slot to
+  queue, and stay VISIT_MINUTES or until the slot ends, whichever is later.
 * Every other market you said ✅ to that runs that day, unless you deleted that day's entry in Google
   Calendar (= not going). Each needs VISIT_MINUTES inside its opening hours that day; hours that
   aren't known are assumed 10:00–20:00 and flagged.
 * Lunch: an hour starting between 13:30 and 14:30, wherever you are at that point.
-* Driving: OpenStreetMap routes × TRAVEL_FACTOR (1.3) + PARKING_MINUTES (5) per leg (scout/geo.py).
-  With a home address (/route home <address>) the day starts and ends there.
+* Driving: OpenStreetMap routes × a Madrid traffic profile for the hour and weekday you leave
+  (rush hours ×1.65–1.7, daytime ×1.25, Saturday shopping hours ×1.35, quiet ×1.1) + PARKING_MINUTES (5).
+* Home: the day starts and ends there. ROUTE_HOME ("address @lat,lon" or an address) in the environment;
+  /route home <address> overrides it.
 * Your preference: markets you tap first are visited first, in the order tapped.
 
 The order is the one with the least driving that fits every opening time and slot (then the earliest
-finish). When not everything fits, you get up to three options — a shorter or later lunch, skipping
-lunch, or leaving out the market(s) that cost the most — and pick one.
+finish). When not everything fits, you get up to three options and pick one.
 
-The search is exact: a dynamic programme over (markets visited, last stop, where you are), keeping
-for each state only plans that are not both later and longer-driven than another.
+Live mode: the plan you're shown for a day (or the option you pick) becomes that day's route. On the
+day, ROUTE_ALERT_MINUTES (5) before each departure you get "time to leave" with the next stop, its
+drive and a Google Maps link, and buttons +10′ / +20′ / 🚗 Leaving now. Each re-plans the rest of the
+day from where you are; if something no longer fits you get the options again.
+
+The search is exact: a dynamic programme over (stops visited, last stop, where you are), keeping for
+each state only plans that are not both later and longer-driven than another.
 """
 
 from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import logging
+import math
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -36,17 +46,48 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, filters
 
 from .db import Database, Event, utcnow
-from .geo import Geo, Leg, Point
+from .geo import FALLBACK_KMH, SAME_PLACE_KM, SAME_PLACE_MINUTES, Geo, Leg, Point, haversine_km
 from .planner import _hm, departure, parse_day, visit_minutes_from_env
 
 log = logging.getLogger(__name__)
 
 HOME_KEY = "route_home"
+ACTIVE_KEY = "route_active:{}"
 DEFAULT_HOURS = (10 * 60, 20 * 60)
 LUNCH = ((13 * 60 + 30, 14 * 60 + 30), 60)          # start window, minutes
 LUNCH_FLEX = ((13 * 60, 15 * 60 + 30), 30)
 MAX_OPTIONS = 3
 MAX_DROP_COMBOS = 80
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+QUEUE_MINUTES = _env_int("QUEUE_MINUTES", 15)
+ALERT_MINUTES = _env_int("ROUTE_ALERT_MINUTES", 5)
+
+
+def traffic_factor(day: date, minute: int) -> float:
+    """Typical Madrid traffic when leaving at `minute` (since midnight) on `day`."""
+    h = (minute % (24 * 60)) / 60
+    wd = day.weekday()
+    if wd < 5:
+        if 7 <= h < 10:
+            return 1.7
+        if 13.5 <= h < 15.5:
+            return 1.45
+        if 17.5 <= h < 20.5:
+            return 1.65
+        if 10 <= h < 21:
+            return 1.25
+        return 1.1
+    if wd == 5:
+        return 1.35 if (11 <= h < 14.5 or 17 <= h < 21) else 1.15
+    return 1.25 if 12 <= h < 15 else 1.1
 
 
 # ============================================================================ the search
@@ -60,8 +101,13 @@ class Stop:
     stay: int = 30
     start: int | None = None       # fixed: slot time
     leave: int | None = None       # fixed: when you go on
+    queue: int = 0                 # fixed: be there this much before the slot
     event_id: int | None = None
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def arrive_by(self) -> int | None:
+        return None if self.start is None else self.start - self.queue
 
 
 @dataclass
@@ -89,13 +135,13 @@ class Route:
         return self.finish + (self.home_back.minutes if self.home_back else 0)
 
 
-LegFn = Callable[[int | None, int | None], Leg]   # loc → loc (None = no known start)
+LegFn = Callable[[int | None, int | None, int], Leg]   # from loc, to loc, leaving at (minutes)
 
 
 def _enter(stop: Stop, arrive: int) -> tuple[int, int] | None:
     """(begin, leave) at this stop when arriving at `arrive`, or None if it doesn't fit."""
     if stop.kind == "fixed":
-        return (stop.start, stop.leave) if arrive <= stop.start else None
+        return (stop.start, stop.leave) if arrive <= stop.arrive_by else None
     if stop.kind == "lunch":
         lo, hi = stop.windows[0]
         begin = max(arrive, lo)
@@ -108,8 +154,10 @@ def _enter(stop: Stop, arrive: int) -> tuple[int, int] | None:
 
 
 def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None,
-          prefs: list[str] | None = None) -> Route | None:
-    """Best order visiting every stop, or None when no order fits."""
+          prefs: list[str] | None = None, origin: int | None = None) -> Route | None:
+    """Best order visiting every stop, or None when no order fits. You set off from `origin`
+    (default: home) at `start` or later, and finish at home when there is one."""
+    first_loc = origin if origin is not None else home
     n = len(stops)
     if n == 0:
         return Route([], 0, start)
@@ -120,9 +168,9 @@ def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None
 
     # label: (time, drive, parent_state, parent_label_index, stop index, arrive, begin, leg)
     State = tuple[int, int, int | None]   # mask, last, loc
-    labels: dict[State, list[tuple]] = {(0, -1, home): [(start, 0, None, None, None, None, None, None)]}
+    labels: dict[State, list[tuple]] = {(0, -1, first_loc): [(start, 0, None, None, None, None, None, None)]}
     by_size: list[list[State]] = [[] for _ in range(n + 1)]
-    by_size[0].append((0, -1, home))
+    by_size[0].append((0, -1, first_loc))
 
     def allowed(mask: int, j: int) -> bool:
         if not pref_order or stops[j].kind != "market":
@@ -140,7 +188,7 @@ def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None
                     if mask >> j & 1 or not allowed(mask, j):
                         continue
                     s = stops[j]
-                    lg = leg(loc, s.loc) if s.loc is not None else None
+                    lg = leg(loc, s.loc, t) if s.loc is not None else None
                     d = lg.minutes if lg else 0
                     fit = _enter(s, t + d)
                     if fit is None:
@@ -149,7 +197,8 @@ def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None
                     new_loc = s.loc if s.loc is not None else loc
                     new_mask = mask | 1 << j
                     # every booked slot still to come must stay reachable
-                    if any(not new_mask >> f & 1 and leave + leg(new_loc, stops[f].loc).minutes > stops[f].start
+                    if any(not new_mask >> f & 1
+                           and leave + leg(new_loc, stops[f].loc, leave).minutes > stops[f].arrive_by
                            for f in fixed):
                         continue
                     key = (new_mask, j, new_loc)
@@ -166,7 +215,7 @@ def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None
     for state in by_size[n]:
         mask, _last, loc = state
         for li, lab in enumerate(labels[state]):
-            back = leg(loc, home) if home is not None else None
+            back = leg(loc, home, lab[0]) if home is not None else None
             score = (lab[1] + (back.minutes if back else 0), lab[0])
             if best is None or score < best[0]:
                 best = (score, state, li, back)
@@ -180,39 +229,51 @@ def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None
         state, li = pstate, pli
     visits.reverse()
     route = Route(visits, total, visits[-1].leave, home_back=back)
-    if home is not None and visits and visits[0].drive:
-        route.home_leave = visits[0].begin - visits[0].drive.minutes
     # Lunch after everything else isn't part of the route: the day is over by then.
     if visits and visits[-1].stop.kind == "lunch":
         visits.pop()
         route.finish = visits[-1].leave if visits else start
         route.lunch = False
+        if home is not None and visits:
+            route.home_back = leg(visits[-1].stop.loc, home, route.finish)
+    if origin is None and home is not None and visits and visits[0].drive:
+        v0 = visits[0]
+        target = v0.stop.arrive_by if v0.stop.kind == "fixed" else v0.begin
+        d = leg(home, v0.stop.loc, target - v0.drive.minutes)   # traffic at the real departure time
+        route.home_leave = target - d.minutes
+        v0.drive, v0.arrive = d, target
     return route
 
 
 def plan_options(fixed: list[Stop], markets: list[Stop], leg: LegFn, start: int = 0, home: int | None = None,
-                 prefs: list[str] | None = None) -> tuple[Route | None, list[Route], str | None]:
-    """(the route, or None; options when not everything fits; a problem that no option can solve)."""
-    def lunch(spec) -> Stop:  # noqa: ANN001
+                 prefs: list[str] | None = None, origin: int | None = None,
+                 lunch: bool = True) -> tuple[Route | None, list[Route], str | None]:
+    """(the route, or None; options when not everything fits; a problem to explain)."""
+    def lunch_stop(spec) -> list[Stop]:  # noqa: ANN001
+        if not lunch:
+            return []
         (lo, hi), stay = spec
-        return Stop("lunch", "Lunch", "lunch", None, [(lo, hi)], stay)
+        return [Stop("lunch", "Lunch", "lunch", None, [(lo, hi)], stay)]
 
-    if fixed and solve(fixed, leg, start, home) is None:
-        return None, *_without_clashing_slots(fixed, markets, leg, start, home, prefs)
-    full = solve(fixed + markets + [lunch(LUNCH)], leg, start, home, prefs)
+    def run(stops: list[Stop]) -> Route | None:
+        return solve(stops, leg, start, home, prefs, origin)
+
+    if fixed and run(fixed) is None:
+        return None, *_without_clashing_slots(fixed, markets, leg, start, home, prefs, origin, lunch)
+    full = run(fixed + markets + lunch_stop(LUNCH))
     if full is not None:
         return full, [], None
     options: list[Route] = []
-    r = solve(fixed + markets + [lunch(LUNCH_FLEX)], leg, start, home, prefs)
-    if r is not None:
-        r.label = "Everything, with a 30′ lunch between 13:00 and 15:30"
-        options.append(r)
+    if lunch:
+        r = run(fixed + markets + lunch_stop(LUNCH_FLEX))
+        if r is not None:
+            r.label = "Everything, with a 30′ lunch between 13:00 and 15:30"
+            options.append(r)
     drops: list[Route] = []
     for k in range(1, len(markets) + 1):
-        combos = list(itertools.combinations(range(len(markets)), k))[:MAX_DROP_COMBOS]
-        for combo in combos:
+        for combo in list(itertools.combinations(range(len(markets)), k))[:MAX_DROP_COMBOS]:
             keep = [m for i, m in enumerate(markets) if i not in combo]
-            r = solve(fixed + keep + [lunch(LUNCH)], leg, start, home, prefs)
+            r = run(fixed + keep + lunch_stop(LUNCH))
             if r is not None:
                 r.dropped = [markets[i] for i in combo]
                 r.label = "Skip " + " and ".join(m.title for m in r.dropped)
@@ -221,13 +282,13 @@ def plan_options(fixed: list[Stop], markets: list[Stop], leg: LegFn, start: int 
             break
     drops.sort(key=lambda r: (r.drive, r.end))
     options += drops[:2]
-    if len(options) < MAX_OPTIONS:
-        r = solve(fixed + markets, leg, start, home, prefs)
+    if lunch and len(options) < MAX_OPTIONS:
+        r = run(fixed + markets)
         if r is not None:
             r.label = "Everything, no lunch break"
             r.lunch = False
             options.append(r)
-    return None, options[:MAX_OPTIONS], None if options else "Nothing fits that day, not even with a market left out."
+    return None, options[:MAX_OPTIONS], None if options else "Nothing fits, not even with a market left out."
 
 
 def clashes(fixed: list[Stop], leg: LegFn) -> list[str]:
@@ -235,25 +296,39 @@ def clashes(fixed: list[Stop], leg: LegFn) -> list[str]:
     out = []
     ordered = sorted(fixed, key=lambda s: s.start)
     for a, b in zip(ordered, ordered[1:]):
-        need = a.leave + leg(a.loc, b.loc).minutes
-        if need > b.start:
+        lg = leg(a.loc, b.loc, a.leave)
+        need = a.leave + lg.minutes
+        if need > b.arrive_by:
             out.append(f"{a.title} {hm(a.start)} and {b.title} {hm(b.start)}: you'd reach the second at "
-                       f"{hm(need)} ({leg(a.loc, b.loc).minutes}′ drive)")
+                       f"{hm(need)} ({lg.minutes}′ drive, {b.queue}′ queue)")
     return out
 
 
 def _without_clashing_slots(fixed: list[Stop], markets: list[Stop], leg: LegFn, start: int, home: int | None,
-                            prefs: list[str] | None) -> tuple[list[Route], str]:
+                            prefs: list[str] | None, origin: int | None,
+                            lunch: bool) -> tuple[list[Route], str]:
     """Booked slots that clash: plans that give up as few of them as possible."""
-    problem = "Your booked slots clash: " + "; ".join(clashes(fixed, leg) or ["not enough time between them"])
+    reasons = clashes(fixed, leg)
+    first_loc = origin if origin is not None else home
+    if first_loc is not None and start > 0:
+        f = min(fixed, key=lambda x: x.start)
+        lg = leg(first_loc, f.loc, start)
+        if start + lg.minutes > f.arrive_by:
+            reasons.insert(0, f"leaving at {hm(start)} you'd reach {f.title} at {hm(start + lg.minutes)}, after "
+                              f"{hm(f.arrive_by)} ({f.queue}′ queue before the {hm(f.start)} slot)")
+            problem = "You'd miss a booked slot: " + "; ".join(reasons)
+        else:
+            problem = "Your booked slots clash: " + "; ".join(reasons or ["not enough time between them"])
+    else:
+        problem = "Your booked slots clash: " + "; ".join(reasons or ["not enough time between them"])
     found: list[Route] = []
-    for k in range(1, len(fixed)):
+    for k in range(1, len(fixed) + 1):
         for combo in itertools.combinations(range(len(fixed)), k):
             keep = [f for i, f in enumerate(fixed) if i not in combo]
-            if solve(keep, leg, start, home) is None:
+            if solve(keep, leg, start, home, None, origin) is None:
                 continue
             gone = [fixed[i] for i in combo]
-            best, options, _ = plan_options(keep, markets, leg, start, home, prefs)
+            best, options, _ = plan_options(keep, markets, leg, start, home, prefs, origin, lunch)
             r = best or (options[0] if options else None)
             if r is None:
                 continue
@@ -270,12 +345,20 @@ def _without_clashing_slots(fixed: list[Stop], markets: list[Stop], leg: LegFn, 
 # ============================================================================ the bot side
 def hm(minutes: int) -> str:
     minutes = max(0, minutes)
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    return f"{minutes // 60 % 24:02d}:{minutes % 60:02d}"
 
 
 def _minutes(dt: datetime, tz) -> int:  # noqa: ANN001
     local = dt.astimezone(tz)
     return local.hour * 60 + local.minute
+
+
+def parse_home(text: str) -> tuple[str, Point | None]:
+    """'C/ Example 1, Town @40.5,-3.6' → (address, point); a plain address → (address, None)."""
+    m = re.search(r"@\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text or "")
+    if not m:
+        return (text or "").strip(), None
+    return text[:m.start()].strip(), (float(m.group(1)), float(m.group(2)))
 
 
 @dataclass
@@ -287,11 +370,27 @@ class DayPlan:
     points: list[Point | None]
     addresses: list[str]
     home: int | None
-    legs: dict[tuple[int | None, int | None], Leg]
+    raw: dict[tuple[int, int], tuple[float, float | None, str]]   # (a, b) → (minutes, km, source)
     start: int
+    parking: float = 5
     best: Route | None = None
     options: list[Route] = field(default_factory=list)
     problem: str | None = None
+    origin: int | None = None          # re-plan: where you are now
+    origin_title: str | None = None
+    prefix: list[dict] = field(default_factory=list)   # re-plan: the part of the day already done
+    lunch_left: bool = True
+
+    def leg(self, a: int | None, b: int | None, t: int) -> Leg:
+        if a is None or b is None or a == b:
+            return Leg(0, 0.0, "same")
+        minutes, km, source = self.raw[(a, b)]
+        if source == "same":
+            return Leg(SAME_PLACE_MINUTES, km, "same")
+        if source == "unknown":
+            return Leg(math.ceil(minutes), None, "unknown")
+        factor = traffic_factor(self.day, t) if source == "osrm" else 1.0
+        return Leg(math.ceil(minutes * factor + self.parking), km, source)
 
 
 class RoutePlanner:
@@ -305,18 +404,25 @@ class RoutePlanner:
         self.now = now or utcnow
         self.prefs: dict[str, list[str]] = {}       # day → stop keys, in the order you tapped
         self.plans: dict[str, DayPlan] = {}
+        self._busy = asyncio.Lock()
 
     def register(self) -> None:
         only_me = filters.Chat(chat_id=self.settings.allowed_chat_id)
         self.app.add_handler(CommandHandler("route", self.cmd_route, filters=only_me))
         self.app.add_handler(CallbackQueryHandler(self.on_callback, pattern=r"^rt:"))
+        if self.app.job_queue is not None:
+            self.app.job_queue.run_repeating(self.tick, interval=60, first=30, name="route-alerts")
 
     # ------------------------------------------------------------ what's on
     def _today(self) -> date:
         return self.now().astimezone(self.tz).date()
 
+    def _now_min(self) -> int:
+        local = self.now().astimezone(self.tz)
+        return local.hour * 60 + local.minute
+
     def _calendar(self):  # noqa: ANN202
-        return self.app.bot_data.get("calendar")
+        return getattr(self.app, "bot_data", {}).get("calendar")
 
     def events_on(self, day: date) -> list[Event]:
         with self.db.session() as s:
@@ -342,8 +448,17 @@ class RoutePlanner:
                 return d
         return today
 
-    def _home(self) -> str | None:
-        return (self.db.get_setting(HOME_KEY) or "").strip() or None
+    def home_text(self) -> str | None:
+        return ((self.db.get_setting(HOME_KEY) or "").strip()
+                or os.environ.get("ROUTE_HOME", "").strip() or None)
+
+    async def _home_point(self) -> tuple[str, Point] | None:
+        text = self.home_text()
+        if not text:
+            return None
+        address, point = parse_home(text)
+        point = point or await self.geo.geocode(address)
+        return (address, point) if point else None
 
     def _hours(self, ev: Event, day: date) -> tuple[list[tuple[int, int]], list[str]]:
         wins, notes = [], []
@@ -365,8 +480,8 @@ class RoutePlanner:
             notes.append(f"opening hours unknown (assumed {hm(DEFAULT_HOURS[0])}–{hm(DEFAULT_HOURS[1])})")
         return wins, notes
 
-    async def build(self, day: date) -> DayPlan:
-        cal = self._calendar()
+    async def build(self, day: date, check_calendar: bool = True) -> DayPlan:
+        cal = self._calendar() if check_calendar else None
         fixed, markets, removed = [], [], []
         points: list[Point | None] = []
         addresses: list[str] = []
@@ -388,7 +503,7 @@ class RoutePlanner:
                 end = _minutes(ev.booked_end, self.tz) if ev.booked_end else None
                 leave = departure(ev.booked_start, ev.booked_end, timedelta(minutes=self.visit))
                 fixed.append(Stop(f"ev{ev.id}", ev.title, "fixed", loc, stay=self.visit, start=start,
-                                  leave=_minutes(leave, self.tz), event_id=ev.id,
+                                  leave=_minutes(leave, self.tz), queue=QUEUE_MINUTES, event_id=ev.id,
                                   notes=notes + ([f"slot {hm(start)}–{hm(end)}"] if end else [])))
             else:
                 wins, more = self._hours(ev, day)
@@ -398,97 +513,106 @@ class RoutePlanner:
                 markets.append(Stop(f"ev{ev.id}", ev.title, "market", loc, wins, self.visit, event_id=ev.id,
                                     notes=notes + more))
         home = None
-        home_addr = self._home()
-        if home_addr:
-            hp = await self.geo.geocode(home_addr)
-            if hp:
-                home = len(points)
-                points.append(hp)
-                addresses.append(home_addr)
+        hp = await self._home_point()
+        if hp:
+            home = len(points)
+            points.append(hp[1])
+            addresses.append(hp[0])
         await self.geo.warm([p for p in points if p])
-        legs: dict[tuple[int | None, int | None], Leg] = {}
-        idx: list[int | None] = list(range(len(points)))
-        for a in idx:
-            for b in idx:
+        raw: dict[tuple[int, int], tuple[float, float | None, str]] = {}
+        for a in range(len(points)):
+            for b in range(len(points)):
                 if a != b:
-                    legs[(a, b)] = await self.geo.leg(points[a], points[b])
-        start = 0
-        if day == self._today():
-            local = self.now().astimezone(self.tz)
-            start = local.hour * 60 + local.minute
-        return DayPlan(day, fixed, markets, removed, points, addresses, home, legs, start)
+                    raw[(a, b)] = await self._raw(points[a], points[b])
+        start = self._now_min() if day == self._today() else 0
+        return DayPlan(day, fixed, markets, removed, points, addresses, home, raw, start,
+                       parking=getattr(self.geo, "parking", 5))
 
-    def _leg_fn(self, plan: DayPlan) -> LegFn:
-        zero = Leg(0, 0.0, "same")
-
-        def leg(a: int | None, b: int | None) -> Leg:
-            if a is None or b is None or a == b:
-                return zero
-            return plan.legs[(a, b)]
-        return leg
+    async def _raw(self, a: Point | None, b: Point | None) -> tuple[float, float | None, str]:
+        if a is None or b is None:
+            return float(getattr(self.geo, "default_minutes", 30)), None, "unknown"
+        straight = haversine_km(a, b)
+        if straight < SAME_PLACE_KM:
+            return 0.0, round(straight, 1), "same"
+        routed = await self.geo.osrm(a, b)
+        if routed is not None:
+            return routed[0], round(routed[1], 1), "osrm"
+        return straight / FALLBACK_KMH * 60, round(straight, 1), "estimate"
 
     def compute(self, plan: DayPlan) -> DayPlan:
         prefs = self.prefs.get(plan.day.isoformat(), [])
-        plan.best, plan.options, plan.problem = plan_options(plan.fixed, plan.markets, self._leg_fn(plan),
-                                                             plan.start, plan.home, prefs)
+        plan.best, plan.options, plan.problem = plan_options(plan.fixed, plan.markets, plan.leg, plan.start,
+                                                             plan.home, prefs, plan.origin, plan.lunch_left)
         return plan
 
     # ------------------------------------------------------------ messages
+    @staticmethod
+    def _where(plan: DayPlan, loc: int) -> str:
+        p = plan.points[loc]
+        return f"{p[0]:.6f},{p[1]:.6f}" if p else plan.addresses[loc]
+
     def _maps_link(self, plan: DayPlan, route: Route) -> str | None:
-        def where(loc: int) -> str:
-            p = plan.points[loc]
-            return f"{p[0]:.6f},{p[1]:.6f}" if p else plan.addresses[loc]
         locs = [v.stop.loc for v in route.visits if v.stop.loc is not None]
         locs = [x for i, x in enumerate(locs) if i == 0 or locs[i - 1] != x]
+        start = plan.origin if plan.origin is not None else plan.home
+        if start is not None:
+            locs = [start] + locs
         if plan.home is not None:
-            locs = [plan.home] + locs + [plan.home]
+            locs = locs + [plan.home]
         if len(locs) < 2:
             return None
         origin, dest, mid = locs[0], locs[-1], locs[1:-1][:9]
-        url = (f"https://www.google.com/maps/dir/?api=1&travelmode=driving&origin={quote(where(origin))}"
-               f"&destination={quote(where(dest))}")
+        url = (f"https://www.google.com/maps/dir/?api=1&travelmode=driving&origin={quote(self._where(plan, origin))}"
+               f"&destination={quote(self._where(plan, dest))}")
         if mid:
-            url += "&waypoints=" + quote("|".join(where(x) for x in mid))
+            url += "&waypoints=" + quote("|".join(self._where(plan, x) for x in mid))
         return url
 
     def route_text(self, plan: DayPlan, route: Route, title: str | None = None) -> str:
         day = plan.day.strftime("%a %-d %b")
         lines = [f"🗺 <b>{escape(title or 'Your route')} — {day}</b>"]
-        if route.home_leave is not None:
+        if plan.origin_title:
+            lines.append(f"From {escape(plan.origin_title)}, leaving <b>{hm(plan.start)}</b>")
+        elif route.home_leave is not None:
             lines.append(f"🏠 Leave home at <b>{hm(route.home_leave)}</b>")
-        prev_leave = None
+        prev_leave = plan.start if plan.origin_title else None
+        if route.home_leave is not None and not plan.origin_title:
+            prev_leave = route.home_leave
         for v in route.visits:
             if v.drive and v.drive.minutes and prev_leave is not None:
                 km = f" · {v.drive.km:g} km" if v.drive.km else ""
                 guess = " (guessed)" if v.drive.guessed else ""
                 lines.append(f"   🚗 {v.drive.minutes}′{km}{guess}")
-            if prev_leave is not None:
-                spare = v.begin - v.arrive
-                if spare >= 10:
-                    lines.append(f"   ⏳ {spare}′ free" + (" (wait for opening)" if v.stop.kind == "market" else ""))
             s = v.stop
+            if prev_leave is not None:
+                ready = s.arrive_by if s.kind == "fixed" else v.begin
+                spare = ready - v.arrive
+                if spare >= 10:
+                    lines.append(f"   ⏳ {spare}′ free" + (" (wait for opening)" if s.kind == "market" else ""))
             if s.kind == "lunch":
                 lines.append(f"🍽 <b>{hm(v.begin)}–{hm(v.leave)}</b>  Lunch nearby")
+            elif s.kind == "fixed":
+                lines.append(f"🎟 <b>{hm(v.begin)}–{hm(v.leave)}</b>  {escape(s.title)} <i>(booked — be there by "
+                             f"{hm(s.arrive_by)} to queue)</i>")
             else:
-                mark = "🎟 " if s.kind == "fixed" else "📍 "
-                tag = " <i>(booked)</i>" if s.kind == "fixed" else ""
-                lines.append(f"{mark}<b>{hm(v.begin)}–{hm(v.leave)}</b>  {escape(s.title)}{tag}")
+                lines.append(f"📍 <b>{hm(v.begin)}–{hm(v.leave)}</b>  {escape(s.title)}")
+            if s.kind != "lunch":
                 where = plan.addresses[s.loc] if s.loc is not None else ""
                 if where:
                     lines.append(f"   {escape(where)}")
                 if s.kind == "market":
                     lines.append("   open " + ", ".join(f"{hm(a)}–{hm(b)}" for a, b in s.windows))
                 for note in s.notes:
-                    lines.append(f"   ⚠️ {escape(note)}" if not note.startswith(("🎟", "slot")) else f"   {escape(note)}")
+                    lines.append(f"   {escape(note)}" if note.startswith(("🎟", "slot")) else f"   ⚠️ {escape(note)}")
             prev_leave = v.leave
         if route.home_back:
             lines.append(f"   🚗 {route.home_back.minutes}′ home · back at <b>{hm(route.end)}</b>")
         lines.append("")
-        lines.append(f"Driving {route.drive}′ in total (incl. parking)"
-                     + ("" if route.lunch else " · no lunch break in this plan"))
+        lines.append(f"Driving {route.drive}′ in total (with traffic for the time of day, incl. parking)"
+                     + ("" if route.lunch or not plan.lunch_left else " · no lunch break in this plan"))
         if route.dropped:
             lines.append("Left out: " + ", ".join(escape(s.title) for s in route.dropped))
-        if plan.removed:
+        if plan.removed and not plan.origin_title:
             lines.append("Not counted (deleted from your calendar): " + ", ".join(escape(t) for t in plan.removed))
         link = self._maps_link(plan, route)
         if link:
@@ -501,13 +625,13 @@ class RoutePlanner:
         if plan.problem:
             lines.append(escape(plan.problem) + ". Pick one:")
         else:
-            lines.append(f"{len(plan.markets) + len(plan.fixed)} markets with the opening times, your slots and an "
-                         f"hour's lunch around 14:00 can't all be done. Pick one:")
+            lines.append(f"{len(plan.markets) + len(plan.fixed)} stops with the opening times, your slots and "
+                         f"lunch can't all be done. Pick one:")
         for i, r in enumerate(plan.options):
             order = " → ".join(escape(v.stop.title if v.stop.kind != "lunch" else "🍽") for v in r.visits)
             lines.append(f"\n<b>{chr(65 + i)}. {escape(r.label)}</b>\n   {order}\n   driving {r.drive}′, "
                          f"done {hm(r.end)}")
-        if plan.removed:
+        if plan.removed and not plan.origin_title:
             lines.append("\nNot counted (deleted from your calendar): " + ", ".join(escape(t) for t in plan.removed))
         return "\n".join(lines)
 
@@ -531,15 +655,19 @@ class RoutePlanner:
                                           callback_data=f"rt:go:{iso}")])
         return "\n".join(lines), InlineKeyboardMarkup(rows)
 
-    async def _send_plan(self, plan: DayPlan, edit=None) -> None:  # noqa: ANN001
-        self.plans[plan.day.isoformat()] = plan
+    async def _send_plan(self, plan: DayPlan, edit=None, title: str | None = None) -> None:  # noqa: ANN001
+        iso = plan.day.isoformat()
+        self.plans[iso] = plan
         markup = None
         if plan.best is not None:
-            text = self.route_text(plan, plan.best)
+            self.activate(plan, plan.best)
+            text = self.route_text(plan, plan.best, title)
+            if plan.day == self._today() or plan.day == self._today() + timedelta(days=1):
+                text += f"\n\n🔔 On the day I'll tell you {ALERT_MINUTES}′ before each time to leave."
         elif plan.options:
             text = self.options_text(plan)
             markup = InlineKeyboardMarkup([[InlineKeyboardButton(
-                f"{chr(65 + i)}", callback_data=f"rt:o:{plan.day.isoformat()}:{i}") for i in range(len(plan.options))]])
+                f"{chr(65 + i)}", callback_data=f"rt:o:{iso}:{i}") for i in range(len(plan.options))]])
         else:
             text = f"🗺 <b>{plan.day.strftime('%a %-d %b')}</b>\n{escape(plan.problem or 'Nothing to plan.')}"
         if edit is not None:
@@ -548,6 +676,129 @@ class RoutePlanner:
             await self.app.bot.send_message(self.settings.allowed_chat_id, text, parse_mode="HTML",
                                             reply_markup=markup, disable_web_page_preview=True)
 
+    # ------------------------------------------------------------ live mode
+    def activate(self, plan: DayPlan, route: Route) -> None:
+        """This becomes the day's route: alerts follow it."""
+        visits = [dict(v) for v in plan.prefix]
+        if visits:  # where you are now: its next stop is the first of the new plan
+            here = visits[-1]
+            if route.visits:
+                v0 = route.visits[0]
+                here["next"] = v0.stop.title if v0.stop.kind != "lunch" else "lunch"
+                here["next_drive"] = v0.drive.minutes if v0.drive else 0
+                here["next_dest"] = self._where(plan, v0.stop.loc) if v0.stop.loc is not None else None
+            elif plan.home is not None:
+                here["next"], here["next_dest"] = "home", self._where(plan, plan.home)
+                here["next_drive"] = route.home_back.minutes if route.home_back else 0
+            else:
+                here["next"] = None
+        for i, v in enumerate(route.visits):
+            nxt = route.visits[i + 1] if i + 1 < len(route.visits) else None
+            loc = v.stop.loc
+            if loc is None:  # lunch: you're where the previous stop was
+                loc = next((x.stop.loc for x in reversed(route.visits[:i]) if x.stop.loc is not None), plan.origin)
+            if nxt is not None:
+                nxt_title = nxt.stop.title if nxt.stop.kind != "lunch" else "lunch"
+                nxt_drive = nxt.drive.minutes if nxt.drive else 0
+                nxt_dest = self._where(plan, nxt.stop.loc) if nxt.stop.loc is not None else None
+            elif plan.home is not None:
+                nxt_title, nxt_drive = "home", (route.home_back.minutes if route.home_back else 0)
+                nxt_dest = self._where(plan, plan.home)
+            else:
+                nxt_title, nxt_drive, nxt_dest = None, 0, None
+            visits.append({"key": v.stop.key, "title": v.stop.title, "kind": v.stop.kind, "begin": v.begin,
+                           "leave": v.leave, "loc_addr": plan.addresses[loc] if loc is not None else None,
+                           "next": nxt_title, "next_drive": nxt_drive, "next_dest": nxt_dest, "alerted": False})
+        home_leave = route.home_leave if not plan.prefix else None
+        state = {"day": plan.day.isoformat(), "visits": visits, "home_leave": home_leave,
+                 "home_alerted": False, "first": visits[0]["title"] if visits else None,
+                 "first_dest": (self._where(plan, route.visits[0].stop.loc)
+                                if route.visits and route.visits[0].stop.loc is not None else None),
+                 "first_drive": route.visits[0].drive.minutes if route.visits and route.visits[0].drive else 0}
+        self.db.set_setting(ACTIVE_KEY.format(plan.day.isoformat()), json.dumps(state))
+
+    def active(self, iso: str) -> dict | None:
+        raw = self.db.get_setting(ACTIVE_KEY.format(iso))
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            return None
+
+    def _save_active(self, iso: str, state: dict) -> None:
+        self.db.set_setting(ACTIVE_KEY.format(iso), json.dumps(state))
+
+    @staticmethod
+    def _go_link(dest: str | None) -> str:
+        return (f'\n<a href="https://www.google.com/maps/dir/?api=1&travelmode=driving&destination={quote(dest)}">'
+                f"Directions with live traffic</a>") if dest else ""
+
+    def _alert_buttons(self, iso: str, i: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("+10′", callback_data=f"rt:x:{iso}:{i}:10"),
+            InlineKeyboardButton("+20′", callback_data=f"rt:x:{iso}:{i}:20"),
+            InlineKeyboardButton("🚗 Leaving now", callback_data=f"rt:n:{iso}:{i}"),
+        ]])
+
+    async def tick(self, ctx: ContextTypes.DEFAULT_TYPE | None = None) -> list[str]:
+        """Every minute: send the "time to leave" alerts of today's route."""
+        iso = self._today().isoformat()
+        state = self.active(iso)
+        if not state:
+            return []
+        now = self._now_min()
+        sent: list[str] = []
+        hl = state.get("home_leave")
+        if hl is not None and not state.get("home_alerted") and hl - ALERT_MINUTES <= now <= hl + 30:
+            state["home_alerted"] = True
+            self._save_active(iso, state)
+            text = (f"🏠 Time to leave home at <b>{hm(hl)}</b> → {escape(state.get('first') or '')} "
+                    f"({state.get('first_drive', 0)}′ by car){self._go_link(state.get('first_dest'))}")
+            await self._send(text)
+            sent.append("home")
+        for i, v in enumerate(state["visits"]):
+            if v.get("alerted") or v.get("next") is None:
+                continue
+            if v["leave"] - ALERT_MINUTES <= now <= v["leave"] + 30:
+                v["alerted"] = True
+                self._save_active(iso, state)
+                where = "lunch" if v["kind"] == "lunch" else escape(v["title"])
+                text = (f"⏰ Leave {where} at <b>{hm(v['leave'])}</b> → next: <b>{escape(v['next'])}</b> "
+                        f"({v['next_drive']}′ by car){self._go_link(v.get('next_dest'))}")
+                await self._send(text, self._alert_buttons(iso, i))
+                sent.append(v["key"])
+        return sent
+
+    async def _send(self, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
+        try:
+            await self.app.bot.send_message(self.settings.allowed_chat_id, text, parse_mode="HTML",
+                                            reply_markup=markup, disable_web_page_preview=True)
+        except Exception:  # noqa: BLE001
+            log.exception("Route alert failed")
+
+    async def replan(self, iso: str, i: int, leave: int, alert_again: bool = False) -> DayPlan | None:
+        """You leave stop i at `leave`: plan the rest of the day from there."""
+        state = self.active(iso)
+        if not state or i >= len(state["visits"]):
+            return None
+        day = date.fromisoformat(iso)
+        plan = await self.build(day, check_calendar=False)
+        by_key = {s.key: s for s in plan.fixed + plan.markets}
+        here = state["visits"][i]
+        rest = [v["key"] for v in state["visits"][i + 1:]]
+        loc_key = next((v["key"] for v in reversed(state["visits"][:i + 1]) if v["kind"] != "lunch"), None)
+        plan.origin = by_key[loc_key].loc if loc_key in by_key else plan.home
+        plan.origin_title = "lunch" if here["kind"] == "lunch" else here["title"]
+        plan.fixed = [by_key[k] for k in rest if k in by_key and by_key[k].kind == "fixed"]
+        plan.markets = [by_key[k] for k in rest if k in by_key and by_key[k].kind == "market"]
+        plan.lunch_left = "lunch" in rest
+        plan.start = leave
+        done = [dict(v) for v in state["visits"][:i + 1]]
+        done[-1]["leave"] = leave
+        done[-1]["alerted"] = not alert_again   # staying longer: remind again at the new time
+        plan.prefix = done
+        self.prefs.pop(iso, None)
+        return await asyncio.to_thread(self.compute, plan)
+
     # ------------------------------------------------------------ handlers
     async def cmd_route(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
@@ -555,18 +806,18 @@ class RoutePlanner:
         if args and args[0].lower() in ("home", "casa"):
             rest = " ".join(args[1:]).strip()
             if not rest:
-                home = self._home()
-                await msg.reply_html(f"🏠 Home: <b>{escape(home)}</b> (<code>/route home off</code> to forget)"
-                                     if home else "No home set. <code>/route home C/ Example 1, Madrid</code> "
-                                                  "makes the day start and end there.")
+                home = self.home_text()
+                await msg.reply_html(f"🏠 Home: <b>{escape(parse_home(home)[0])}</b>" if home else
+                                     "No home set. <code>/route home C/ Example 1, Madrid</code> makes the day "
+                                     "start and end there.")
             elif rest.lower() in ("off", "none", "clear"):
                 self.db.set_setting(HOME_KEY, "")
-                await msg.reply_text("Home forgotten: routes start at the first market.")
-            elif await self.geo.geocode(rest) is None:
+                await msg.reply_text("Home override cleared." + (" Using the default home." if self.home_text() else ""))
+            elif parse_home(rest)[1] is None and await self.geo.geocode(rest) is None:
                 await msg.reply_text("I couldn't find that address on the map. Try adding the town.")
             else:
                 self.db.set_setting(HOME_KEY, rest)
-                await msg.reply_html(f"🏠 Home set: <b>{escape(rest)}</b>. Routes now start and end there.")
+                await msg.reply_html(f"🏠 Home set: <b>{escape(parse_home(rest)[0])}</b>.")
             return
         if args:
             day = parse_day(" ".join(args), self._today())
@@ -598,6 +849,9 @@ class RoutePlanner:
         q = update.callback_query
         parts = (q.data or "").split(":")
         action, iso = parts[1], parts[2]
+        if action in ("x", "n"):
+            await self._on_live(q, action, iso, parts)
+            return
         plan = self.plans.get(iso)
         if plan is None:
             await q.answer("That plan is old — send /route again.", show_alert=True)
@@ -617,15 +871,37 @@ class RoutePlanner:
             if i >= len(plan.options):
                 await q.answer("That option is gone — send /route again.", show_alert=True)
                 return
-            await q.answer()
+            await q.answer("This is your route now")
             r = plan.options[i]
+            self.activate(plan, r)
             await self.app.bot.send_message(self.settings.allowed_chat_id,
                                             self.route_text(plan, r, f"Option {chr(65 + i)}"), parse_mode="HTML",
                                             disable_web_page_preview=True)
 
+    async def _on_live(self, q, action: str, iso: str, parts: list[str]) -> None:  # noqa: ANN001
+        i = int(parts[3])
+        state = self.active(iso)
+        if not state or i >= len(state["visits"]):
+            await q.answer("That route is no longer active.", show_alert=True)
+            return
+        if action == "x":
+            extra = int(parts[4])
+            leave = max(state["visits"][i]["leave"], self._now_min()) + extra
+            await q.answer(f"OK, {extra}′ more — re-planning…")
+        else:
+            leave = self._now_min()
+            await q.answer("Re-planning from now…")
+        try:
+            await q.edit_message_reply_markup(None)
+        except Exception:  # noqa: BLE001 - an old message may not be editable
+            pass
+        async with self._busy:
+            plan = await self.replan(iso, i, leave, alert_again=action == "x")
+        if plan is not None:
+            await self._send_plan(plan, title="Updated route")
 
     async def task_text(self, args: list[str]) -> str:
-        """`python -m scout.cron route [day]`: the plan as plain text (no preference)."""
+        """`python -m scout.cron route [day]`: the plan as plain text (no preference, not activated)."""
         day = parse_day(" ".join(args), self._today()) if args else self.default_day()
         if day is None:
             return "usage: route [day]"
@@ -650,4 +926,3 @@ def setup_route(app: Application, settings, db: Database, geo: Geo | None = None
     if tasks is not None:
         tasks.register("route", rp.task_text, "Print the best route for a day: route [day]", None, takes_args=True)
     return rp
-

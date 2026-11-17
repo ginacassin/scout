@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from scout.db import Account, Database, Event
 from scout.geo import Leg
-from scout.route import LUNCH, RoutePlanner, Stop, hm, plan_options, solve
+from scout.route import LUNCH, RoutePlanner, Stop, hm, parse_home, plan_options, solve, traffic_factor
 
 TZ = ZoneInfo("Europe/Madrid")
 
@@ -19,7 +19,7 @@ def H(s: str) -> int:
 
 
 def matrix_leg(m: dict[tuple[int, int], int]):
-    def leg(a, b):
+    def leg(a, b, t=0):
         if a is None or b is None or a == b:
             return Leg(0, 0.0, "same")
         return Leg(m.get((a, b), m.get((b, a), 30)), 1.0, "osrm")
@@ -30,8 +30,8 @@ def market(i, title, opens="10:00", closes="14:00", stay=30):
     return Stop(f"m{i}", title, "market", i, [(H(opens), H(closes))], stay)
 
 
-def fixed(i, title, at, stay=30):
-    return Stop(f"f{i}", title, "fixed", i, stay=stay, start=H(at), leave=H(at) + stay)
+def fixed(i, title, at, stay=30, queue=0):
+    return Stop(f"f{i}", title, "fixed", i, stay=stay, start=H(at), leave=H(at) + stay, queue=queue)
 
 
 def order(route):
@@ -119,8 +119,15 @@ def test_home_start_and_return():
 
 # ------------------------------------------------------------------ bot side
 class FakeGeo:
+    parking = 5
+    default_minutes = 30
+
     def __init__(self, places):
         self.places = places
+
+    async def osrm(self, a, b):
+        km = abs(a[0] - b[0]) * 100 + abs(a[1] - b[1]) * 100
+        return km * 1.5, km
 
     async def locate(self, address, area):
         return self.places.get(address)
@@ -215,3 +222,98 @@ async def test_other_day_of_a_booked_market_is_not_on_the_route():
 def test_lunch_constant_is_around_two():
     (lo, hi), stay = LUNCH
     assert hm(lo) == "13:30" and hm(hi) == "14:30" and stay == 60
+
+
+
+def test_booked_slot_needs_arriving_15_minutes_early():
+    leg = matrix_leg({(0, 1): 20})
+    m = market(0, "Flat", "10:00", "19:00")
+    r = solve([m, fixed(1, "Booked", "11:00", queue=15)], leg, start=H("10:00"))
+    assert order(r) == ["Booked", "Flat"]  # 10:00–10:30 then 20′ → 10:50, too late for a 10:45 queue
+    r = solve([m, fixed(1, "Booked", "11:00", queue=0)], leg, start=H("10:00"))
+    assert order(r) == ["Flat", "Booked"]
+
+
+def test_traffic_profile():
+    fri, sat, sun = date(2026, 11, 20), date(2026, 11, 21), date(2026, 11, 22)
+    assert traffic_factor(fri, H("08:30")) > traffic_factor(fri, H("11:00")) > traffic_factor(fri, H("22:00"))
+    assert traffic_factor(fri, H("18:30")) >= 1.6
+    assert traffic_factor(sat, H("12:00")) > traffic_factor(sat, H("09:00"))
+    assert traffic_factor(sun, H("09:00")) < traffic_factor(fri, H("09:00"))
+
+
+def test_drive_times_follow_the_hour():
+    rp, day, _ = world()
+    import asyncio
+    plan = asyncio.run(rp.build(day))
+    plan.day = date(2026, 11, 20)  # a Friday: rush hour vs late evening
+    a, b = 0, 1
+    assert plan.leg(a, b, H("08:30")).minutes > plan.leg(a, b, H("22:00")).minutes
+
+
+def test_parse_home():
+    assert parse_home("C. del Miño 6, Alcobendas @40.544,-3.6388") == ("C. del Miño 6, Alcobendas", (40.544, -3.6388))
+    assert parse_home("Calle Mayor 1") == ("Calle Mayor 1", None)
+
+
+# ------------------------------------------------------------------ live mode
+class Bot:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text, **kw):
+        self.sent.append((text, kw.get("reply_markup")))
+
+
+def live_world(monkeypatch, at="09:00"):
+    rp, day, rows = world()
+    clock = {"now": datetime(2026, 11, 21, *map(int, at.split(":")), tzinfo=TZ)}
+    rp.now = lambda: clock["now"]
+    rp.app.bot = Bot()
+    monkeypatch.setenv("ROUTE_HOME", "Home 1 @40.54,-3.64")
+    return rp, day, clock
+
+
+async def test_alerts_before_leaving_and_extend_replans(monkeypatch):
+    rp, day, clock = live_world(monkeypatch)
+    plan = rp.compute(await rp.build(day))
+    assert plan.best is not None and plan.best.home_leave is not None
+    rp.activate(plan, plan.best)
+    state = rp.active(day.isoformat())
+    first = state["visits"][0]
+
+    clock["now"] = datetime.combine(day, datetime.min.time(), TZ) + timedelta(minutes=state["home_leave"] - 5)
+    assert await rp.tick() == ["home"]
+    assert "Time to leave home" in rp.app.bot.sent[-1][0]
+
+    clock["now"] = datetime.combine(day, datetime.min.time(), TZ) + timedelta(minutes=first["leave"] - 5)
+    assert await rp.tick() == [first["key"]]
+    text, markup = rp.app.bot.sent[-1]
+    assert "Leave" in text and first["next"] in text and "google.com/maps/dir" in text
+    labels = [b.text for b in markup.inline_keyboard[0]]
+    assert labels == ["+10′", "+20′", "🚗 Leaving now"]
+    assert await rp.tick() == []                        # once only
+
+    new = await rp.replan(day.isoformat(), 0, first["leave"] + 20, alert_again=True)
+    assert new.origin_title == first["title"] and new.start == first["leave"] + 20
+    # 20′ more at the first market means missing the 11:00 booked slot (10:45 to queue): say so, offer the rest
+    assert new.best is None and "miss a booked slot" in new.problem and "Booked loft" in new.problem
+    assert new.options and new.options[0].dropped[0].title == "Booked loft"
+    rp.activate(new, new.options[0])
+    state = rp.active(day.isoformat())
+    assert state["visits"][0]["leave"] == first["leave"] + 20 and state["visits"][0]["alerted"] is False
+    assert [v["key"] for v in state["visits"][1:]]          # the rest of the day re-planned
+    clock["now"] += timedelta(minutes=20)
+    assert await rp.tick() == [first["key"]]            # reminded again at the new time
+
+
+async def test_leaving_now_replans_from_here(monkeypatch):
+    rp, day, clock = live_world(monkeypatch)
+    plan = rp.compute(await rp.build(day))
+    rp.activate(plan, plan.best)
+    first = rp.active(day.isoformat())["visits"][0]
+    new = await rp.replan(day.isoformat(), 0, first["leave"] - 10)
+    best = new.best or new.options[0]
+    assert best.visits[0].arrive <= first["leave"] - 10 + best.visits[0].drive.minutes
+    rp.activate(new, best)
+    assert rp.active(day.isoformat())["visits"][0]["alerted"] is True
