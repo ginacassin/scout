@@ -56,6 +56,7 @@ WARNED_KEY = "gcal_warned"
 RETRY_SECONDS = 600
 BOOKING = "booking"
 BOOKED = "booked"
+SKIPPED = "skipped"  # day entries you deleted in Google Calendar: not going that day, don't recreate
 QUOTA_WARNED_KEY = "gdrive_quota_warned"
 TICKET_IN_CHAT = "Ticket QR: in your Scout chat (pinned)"
 MY_TICKETS = "https://www.eventbrite.es/mytickets/"
@@ -287,6 +288,15 @@ def _hm(value: str | None) -> tuple[int, int] | None:
         return None
 
 
+def key_covers(key: str, day: date) -> bool:
+    """Day entry keys are "2026-11-21" or a run of all-day days "2026-11-21..2026-11-22"."""
+    first, _, last = key.partition("..")
+    try:
+        return date.fromisoformat(first) <= day <= date.fromisoformat(last or first)
+    except ValueError:
+        return False
+
+
 def patch_body(body: dict[str, Any]) -> dict[str, Any]:
     """A PATCH merges start/end with what the entry has, so an all-day entry that gets hours (or the
     reverse) would hold both "date" and "dateTime" → 400 Invalid start time. Clear the other one."""
@@ -375,7 +385,7 @@ def load_state(raw: str | None) -> dict[str, Any]:
     if isinstance(data, list):  # tolerate a bare list of ids
         return {"days": {f"legacy{i}": x for i, x in enumerate(data)}, "booking": None}
     out = {"days": dict(data.get("days") or {}), "booking": data.get("booking")}
-    for extra in (BOOKED, "ticket", "files"):
+    for extra in (BOOKED, "ticket", "files", SKIPPED):
         if data.get(extra):
             out[extra] = data[extra]
     return out
@@ -383,10 +393,10 @@ def load_state(raw: str | None) -> dict[str, Any]:
 
 def dump_state(state: dict[str, Any]) -> str | None:
     if not state["days"] and not state["booking"] and not state.get(BOOKED) and not state.get("ticket") \
-            and not state.get("files"):
+            and not state.get("files") and not state.get(SKIPPED):
         return None
     out = {"days": state["days"], "booking": state["booking"]}
-    for extra in (BOOKED, "ticket", "files"):
+    for extra in (BOOKED, "ticket", "files", SKIPPED):
         if state.get(extra):
             out[extra] = state[extra]
     return json.dumps(out)
@@ -595,7 +605,10 @@ class CalendarSync:
             await self._delete(gid)
             self._drop(state, key)
             self._save_state(event_id, state)
+        skipped = state.setdefault(SKIPPED, [])
         for key, body in desired.items():
+            if key in skipped:
+                continue  # you deleted this day in Google Calendar: not going, leave it out
             gid = existing.get(key)
             res = None
             if gid:
@@ -605,7 +618,16 @@ class CalendarSync:
                 except CalendarError as exc:
                     if exc.status not in (404, 410):
                         raise
-                    res = None  # deleted by hand in Google Calendar: recreate below
+                    res = {"status": "cancelled"}
+                if res.get("status") == "cancelled" and key not in (BOOKING, BOOKED):
+                    # Deleted by hand in Google Calendar = not going that day. Remember, don't recreate.
+                    skipped.append(key)
+                    self._drop(state, key)
+                    self._save_state(event_id, state)
+                    log.info("Calendar: event %s day %s was deleted in Google Calendar; leaving it out", event_id, key)
+                    continue
+                if res.get("status") == "cancelled":
+                    res = None
             if res is None:
                 res = await self._insert(body)
                 created += 1
@@ -628,6 +650,44 @@ class CalendarSync:
         elif reason == "update" and (created or patched):
             what = "; ".join(changes) if changes else ev.title
             await self._reply(ev, f"📅 Calendar updated: {what}", first_link)
+
+    def _clear_skipped(self, event_id: int) -> None:
+        with self.db.session() as s:
+            row = s.get(Event, event_id)
+            if row is None:
+                return
+            state = load_state(row.gcal_event_id)
+            if state.pop(SKIPPED, None):
+                row.gcal_event_id = dump_state(state)
+
+    async def removed_on(self, event_id: int, day: date) -> bool:
+        """Did you delete this market's calendar entry for `day` (= not going that day)?"""
+        with self.db.session() as s:
+            ev = s.get(Event, event_id)
+        if ev is None:
+            return False
+        state = load_state(ev.gcal_event_id)
+        if any(key_covers(k, day) for k in state.get(SKIPPED) or []):
+            return True
+        if ev.booked_start is not None:
+            return False  # a booked slot is never "removed" here
+        gid = next((g for k, g in state["days"].items() if key_covers(k, day)), None)
+        if gid is None:
+            return False  # not synced (yet): count it as on your calendar
+        try:
+            item = await self._call("GET", f"{self._events_url}/{quote(gid, safe='')}")
+        except CalendarError as exc:
+            if exc.status not in (404, 410):
+                log.warning("Calendar check for event %s failed: %s", event_id, exc)
+                return False
+            item = {"status": "cancelled"}
+        if item.get("status") != "cancelled":
+            return False
+        key = next(k for k, g in state["days"].items() if g == gid)
+        state.setdefault(SKIPPED, []).append(key)
+        self._drop(state, key)
+        self._save_state(event_id, state)
+        return True
 
     @staticmethod
     def _drop(state: dict[str, Any], key: str) -> None:
@@ -804,6 +864,8 @@ class CalendarSync:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
     async def on_decision(self, event_id: int, old: str, new: str, **_) -> None:  # noqa: ANN003
+        if new == "yes" and old != "yes":
+            self._clear_skipped(event_id)  # a fresh ✅ puts every day back
         if new == "yes" or old == "yes":
             self._spawn(self.sync(event_id, reason="decision"))
 

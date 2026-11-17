@@ -43,6 +43,10 @@ class FakeGoogle:
         base = f"/calendar/v3/calendars/{CAL}/events"
         assert path.startswith(base), path
         rest = path[len(base):].strip("/")
+        if request.method == "GET" and rest:
+            if rest not in self.events:
+                return httpx.Response(404, json={"error": {"message": "Not Found"}})
+            return httpx.Response(200, json=self.events[rest])
         if request.method == "GET":
             prop = request.url.params.get("privateExtendedProperty")
             items = list(self.events.values())
@@ -341,3 +345,33 @@ def test_patch_switching_all_day_and_timed_clears_the_other_form():
     assert timed["start"] == {"dateTime": "2026-11-22T11:00:00", "timeZone": "Europe/Madrid", "date": None}
     allday = patch_body({"start": {"date": "2026-11-22"}, "end": {"date": "2026-11-23"}})
     assert allday["start"] == {"date": "2026-11-22", "dateTime": None, "timeZone": None}
+
+
+async def test_day_deleted_in_google_calendar_stays_deleted(world):
+    sync, db, google, _ = world
+    sessions = [{"date": "2026-11-13", "start": "10:00", "end": "14:00", "booking_required": False},
+                {"date": "2026-11-14", "start": "10:00", "end": "14:00", "booking_required": False}]
+    ev_id = add_event(db, dates=dates(13, 14), sessions=json.dumps(sessions), area="Chamberí")
+    assert await sync.sync(ev_id)
+    sat = google.by_key()["2026-11-14"]["id"]
+    del google.events[sat]                                  # you delete Saturday: not going
+    assert await sync.removed_on(ev_id, date(2026, 11, 14))
+    assert not await sync.removed_on(ev_id, date(2026, 11, 13))
+    assert await sync.sync(ev_id, reason="update")
+    assert set(google.by_key()) == {"2026-11-13"}           # not recreated
+    assert stored(db, ev_id)["skipped"] == ["2026-11-14"]
+    await sync.on_decision(ev_id, old="maybe", new="yes")   # a fresh ✅ brings every day back
+    await sync.drain()
+    assert set(google.by_key()) == {"2026-11-13", "2026-11-14"}
+
+
+async def test_deleted_day_found_while_syncing_is_not_recreated(world):
+    sync, db, google, _ = world
+    sessions = [{"date": "2026-11-13", "start": "10:00", "end": "14:00", "booking_required": False},
+                {"date": "2026-11-14", "start": "10:00", "end": "14:00", "booking_required": False}]
+    ev_id = add_event(db, dates=dates(13, 14), sessions=json.dumps(sessions), area="Chamberí")
+    assert await sync.sync(ev_id)
+    del google.events[google.by_key()["2026-11-13"]["id"]]
+    assert await sync.sync(ev_id, reason="update")
+    assert set(google.by_key()) == {"2026-11-14"}
+    assert stored(db, ev_id)["skipped"] == ["2026-11-13"]

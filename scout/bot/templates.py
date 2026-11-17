@@ -215,6 +215,7 @@ HELP = (
     "/logs — recent warnings and errors (<code>/logs all</code> for everything)\n"
     "/booked <i>id HH:MM [date]</i> — tell me you booked a slot · /unbook <i>id</i>\n"
     "/hunt <i>id [before HH:MM]</i> — watch for released free tickets (or an earlier slot than yours) · <code>/hunt id off</code>\n"
+    "/route <i>[day]</i> — the best order to visit that day's markets by car, around your booked slots and lunch · <code>/route home address</code>\n"
     "/note <i>id text</i> — remember something for a market (or reply to its card, also with a photo) · /notes · /delnote\n"
     "👀 Sneak peeks: photos of what's for sale arrive in albums — tap ⭐ to keep one in the notes and calendar\n"
     "/google — link Google Drive so tickets and note photos are attached to calendar entries\n\n"

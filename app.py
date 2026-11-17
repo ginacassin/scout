@@ -69,6 +69,8 @@ def main() -> None:
     autobook = setup_autobook(app, settings, db)
     app.bot_data["autobook"] = autobook
     app.bot_data["planner"] = setup_planner(app, settings, db, autobook)  # /plan; route-aware slot choice
+    from scout.route import setup_route
+    setup_route(app, settings, db, geo=app.bot_data["planner"].geo, tasks=tasks)  # /route: order a whole day by car
     setup_briefing(app, settings, db)  # morning briefing on market days, /today, daily Eventbrite login check
     setup_uptime(app, settings, db)  # tells you only when Scout was down or checks keep failing
     register_admin(app, settings, db, notifier)  # /merge, in-place card refresh on updates/merges
@@ -103,7 +105,8 @@ def main() -> None:
             ("logs", "Recent warnings and errors"),
             ("autobook", "Auto-book free Eventbrite tickets"),
             ("merge", "Merge two duplicate markets"),
-            ("plan", "Your market route for a day"),
+            ("route", "Plan the order to visit a day's markets by car"),
+            ("plan", "Booked slots and auto-booking for a day"),
             ("google", "Link Google Drive for calendar attachments"),
             ("today", "Today's markets: briefing"),
             ("briefing", "Briefing for a day (e.g. /briefing tomorrow)"),

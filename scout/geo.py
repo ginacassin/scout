@@ -3,7 +3,8 @@
 * Geocoding: Nominatim (OpenStreetMap), limited to Spain and a box around the Comunidad de Madrid,
   at most one request per second, cached forever in SQLite (misses are retried after a week).
 * Driving time: the public OSRM demo server, cached in SQLite.
-* Madrid buffer: drive_minutes = osrm_minutes * TRAVEL_FACTOR (1.3) + PARKING_MINUTES (10).
+* Madrid buffer: drive_minutes = osrm_minutes * TRAVEL_FACTOR (1.3) + PARKING_MINUTES (5).
+* Many stops at once (route planner): one OSRM table request fills the cache for every pair.
 * Fallbacks: no route -> straight-line distance at 25 km/h + parking; no coordinates at all ->
   DEFAULT_DRIVE_MINUTES (30), flagged "unknown" so the planner can say it guessed.
 
@@ -30,6 +31,7 @@ log = logging.getLogger(__name__)
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving/{a_lon},{a_lat};{b_lon},{b_lat}"
+OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving/{coords}"
 USER_AGENT = "ScoutBot/1.0 (personal use)"
 # left, top, right, bottom (lon/lat) around the Comunidad de Madrid
 MADRID_VIEWBOX = "-4.58,41.17,-3.05,39.88"
@@ -102,7 +104,7 @@ class Geo:
         self.db = db
         self.transport = transport
         self.travel_factor = travel_factor if travel_factor is not None else _env_float("TRAVEL_FACTOR", 1.3)
-        self.parking = parking_minutes if parking_minutes is not None else _env_float("PARKING_MINUTES", 10)
+        self.parking = parking_minutes if parking_minutes is not None else _env_float("PARKING_MINUTES", 5)
         self.default_minutes = (default_minutes if default_minutes is not None
                                 else _env_float("DEFAULT_DRIVE_MINUTES", 30))
         self.min_interval_s = min_interval_s
@@ -201,6 +203,39 @@ class Geo:
         with self.db.session() as s:
             s.merge(RouteCache(key=key, minutes=minutes, km=km, fetched_at=utcnow()))
         return minutes, km
+
+    async def warm(self, points: list[Point]) -> int:
+        """Fetch every missing pair among `points` with one OSRM table request; returns pairs cached."""
+        pts = list(dict.fromkeys(points))
+        if len(pts) < 2:
+            return 0
+        with self.db.session() as s:
+            missing = [(a, b) for a in pts for b in pts if a != b and haversine_km(a, b) >= SAME_PLACE_KM
+                       and s.get(RouteCache, _route_key(a, b)) is None]
+        if not missing:
+            return 0
+        coords = ";".join(f"{p[1]:.6f},{p[0]:.6f}" for p in pts)
+        try:
+            async with self._client() as c:
+                r = await c.get(OSRM_TABLE_URL.format(coords=coords), params={"annotations": "duration,distance"})
+            data = r.json() if r.status_code == 200 else {}
+            if data.get("code") != "Ok":
+                log.warning("OSRM table gave no result (HTTP %s, %s)", r.status_code, data.get("code"))
+                return 0
+            durations, distances = data["durations"], data["distances"]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            log.warning("OSRM table failed: %s", type(exc).__name__)
+            return 0
+        n = 0
+        with self.db.session() as s:
+            for i, a in enumerate(pts):
+                for j, b in enumerate(pts):
+                    if (a, b) not in missing or durations[i][j] is None or distances[i][j] is None:
+                        continue
+                    s.merge(RouteCache(key=_route_key(a, b), minutes=float(durations[i][j]) / 60.0,
+                                       km=float(distances[i][j]) / 1000.0, fetched_at=utcnow()))
+                    n += 1
+        return n
 
     def buffered(self, osrm_minutes: float) -> int:
         return math.ceil(osrm_minutes * self.travel_factor + self.parking)
