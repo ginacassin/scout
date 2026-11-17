@@ -390,3 +390,20 @@ async def test_route_command_asks_the_start_time(monkeypatch):
     msg = Msg()
     await rp.cmd_route(SimpleNamespace(effective_message=msg), SimpleNamespace(args=["21/11"]))
     assert "When do you start?" in msg.note.edits[-1]
+
+
+
+async def test_no_lunch_when_starting_at_lunchtime_unless_asked(monkeypatch):
+    monkeypatch.setenv("ROUTE_HOME", "Home 1 @40.54,-3.64")
+    rp, day, rows = world()
+    plan = await rp.build(day)
+    rp.set_start(plan, H("14:30"), free=True)
+    assert plan.lunch_left is False
+    rp.compute(plan)
+    r = plan.best or plan.options[0]
+    assert all(v.stop.kind != "lunch" for v in r.visits)
+    assert "no lunch break in this plan" not in rp.route_text(plan, r)
+    rp.set_start(plan, H("10:00"), free=False)
+    assert plan.lunch_left is True
+    text, kb = rp.ask_text(plan)
+    assert any("Lunch break" in b.text for row in kb.inline_keyboard for b in row)

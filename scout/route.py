@@ -56,6 +56,7 @@ ACTIVE_KEY = "route_active:{}"
 DEFAULT_HOURS = (10 * 60, 20 * 60)
 LUNCH = ((13 * 60 + 30, 14 * 60 + 30), 60)          # start window, minutes
 LUNCH_FLEX = ((13 * 60, 15 * 60 + 30), 30)
+LUNCH_FROM_BEFORE = 13 * 60   # a lunch break only when the day starts before this
 MAX_OPTIONS = 3
 MAX_DROP_COMBOS = 80
 
@@ -575,7 +576,7 @@ class RoutePlanner:
         plan.start = max(begin_at or 0, self._now_min() if today else 0)
         if free is not None:
             plan.free_start = free
-        plan.lunch_left = plan.start <= LUNCH[0][1]   # starting after lunchtime: no lunch break
+        plan.lunch_left = plan.start < LUNCH_FROM_BEFORE   # setting off at 13:00 or later: you've eaten
         t = plan.start
         plan.fixed = [f for f in plan.all_fixed if f.arrive_by >= t]
         plan.markets = [m for m in plan.all_markets if any(hi >= max(lo, t) + m.stay for lo, hi in m.windows)]
@@ -698,6 +699,8 @@ class RoutePlanner:
             n = prefs.index(s.key) + 1 if s.key in prefs else None
             rows.append([InlineKeyboardButton(f"{n}️⃣ {s.title}"[:60] if n else s.title[:60],
                                               callback_data=f"rt:p:{iso}:{s.key}")])
+        rows.append([InlineKeyboardButton(("✅ " if plan.lunch_left else "❌ ") + "🍽 Lunch break ~14:00",
+                                          callback_data=f"rt:l:{iso}")])
         if plan.home is not None:
             rows.append([InlineKeyboardButton(("✅ " if not plan.free_start else "") + "🏠 From home",
                                               callback_data=f"rt:s:{iso}:home"),
@@ -948,6 +951,12 @@ class RoutePlanner:
             self.set_start(plan, begin_at, free=begin_at is not None)
             await q.answer()
             await self._after_start(plan, q)
+            return
+        if action == "l":
+            plan.lunch_left = not plan.lunch_left
+            await q.answer("Lunch break on" if plan.lunch_left else "No lunch break")
+            text, kb = self.ask_text(plan)
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             return
         if action == "s":
             plan.free_start = parts[3] == "free"
