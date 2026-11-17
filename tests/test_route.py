@@ -347,3 +347,46 @@ async def test_from_opening_keeps_everything(monkeypatch):
     text, kb = rp.time_text(plan)
     labels = [b.text for row in kb.inline_keyboard for b in row]
     assert labels[0] == "☀️ From opening" and "18:30" in labels
+
+
+
+class Note:
+    """The "Working out the route…" message: has edit_text, not edit_message_text."""
+    def __init__(self):
+        self.edits = []
+
+    async def edit_text(self, text, **kw):
+        self.edits.append(text)
+
+    async def delete(self):
+        pass
+
+
+class Msg:
+    def __init__(self):
+        self.note = Note()
+
+    async def reply_text(self, text, **kw):
+        return self.note
+
+    async def reply_html(self, text, **kw):
+        return self.note
+
+
+async def test_route_command_with_a_time(monkeypatch):
+    monkeypatch.setenv("ROUTE_HOME", "Home 1 @40.54,-3.64")
+    rp, day, rows = world()
+    rp.app.bot = Bot()
+    msg = Msg()
+    update = SimpleNamespace(effective_message=msg)
+    await rp.cmd_route(update, SimpleNamespace(args=["21/11", "17:00"]))
+    out = msg.note.edits + [t for t, _ in rp.app.bot.sent]
+    assert any("Where do you want to start" in t or "Your route" in t or "not everything fits" in t for t in out)
+
+
+async def test_route_command_asks_the_start_time(monkeypatch):
+    monkeypatch.setenv("ROUTE_HOME", "Home 1 @40.54,-3.64")
+    rp, day, rows = world()
+    msg = Msg()
+    await rp.cmd_route(SimpleNamespace(effective_message=msg), SimpleNamespace(args=["21/11"]))
+    assert "When do you start?" in msg.note.edits[-1]

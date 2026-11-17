@@ -360,6 +360,14 @@ def _minutes(dt: datetime, tz) -> int:  # noqa: ANN001
     return local.hour * 60 + local.minute
 
 
+async def _edit(target, text: str, **kw) -> None:  # noqa: ANN001
+    """Edit the bot's message: `target` is a button tap (CallbackQuery) or the message itself."""
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(text, **kw)
+    else:
+        await target.edit_text(text, **kw)
+
+
 def parse_home(text: str) -> tuple[str, Point | None]:
     """'C/ Example 1, Town @40.5,-3.6' → (address, point); a plain address → (address, None)."""
     m = re.search(r"@\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text or "")
@@ -719,11 +727,11 @@ class RoutePlanner:
             text = f"🗺 Nothing left to visit by then on {plan.day.strftime('%a %-d %b')}."
             if plan.closed:
                 text += "\nClosed by then: " + ", ".join(plan.closed)
-            await edit.edit_message_text(text)
+            await _edit(edit, text)
             return
         if len(plan.markets) >= 2 or (plan.markets and plan.home is not None and plan.begin_at is not None):
             text, kb = self.ask_text(plan)
-            await edit.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            await _edit(edit, text, parse_mode="HTML", reply_markup=kb)
             return
         await self._send_plan(await asyncio.to_thread(self.compute, plan), edit=edit)
 
@@ -743,7 +751,7 @@ class RoutePlanner:
         else:
             text = f"🗺 <b>{plan.day.strftime('%a %-d %b')}</b>\n{escape(plan.problem or 'Nothing to plan.')}"
         if edit is not None:
-            await edit.edit_message_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+            await _edit(edit, text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
         else:
             await self.app.bot.send_message(self.settings.allowed_chat_id, text, parse_mode="HTML",
                                             reply_markup=markup, disable_web_page_preview=True)
