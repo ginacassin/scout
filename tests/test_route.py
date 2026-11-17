@@ -317,3 +317,33 @@ async def test_leaving_now_replans_from_here(monkeypatch):
     assert best.visits[0].arrive <= first["leave"] - 10 + best.visits[0].drive.minutes
     rp.activate(new, best)
     assert rp.active(day.isoformat())["visits"][0]["alerted"] is True
+
+
+
+async def test_after_work_start_straight_to_chosen_first_market(monkeypatch):
+    monkeypatch.setenv("ROUTE_HOME", "Home 1 @40.54,-3.64")
+    rp, day, rows = world()
+    plan = await rp.build(day)
+    rp.set_start(plan, H("17:00"), free=True)
+    # Alma flat closes 14:00 and the 11:00 booked slot is over: both left out and named
+    assert {s.title for s in plan.markets} == {"Batres barn", "Skipped one"}
+    assert any("Alma flat" in c for c in plan.closed) and any("Booked loft" in c for c in plan.closed)
+    rp.prefs[day.isoformat()] = [next(s.key for s in plan.markets if s.title == "Skipped one")]
+    rp.compute(plan)
+    r = plan.best or plan.options[0]
+    assert r.visits[0].stop.title == "Skipped one"
+    assert r.visits[0].begin == H("17:00") and r.home_leave is None    # no drive from home at the start
+    assert r.home_back is not None                                       # still ends at home
+    text = rp.route_text(plan, r)
+    assert "Starting at <b>17:00</b>, straight to the first stop" in text and "Closed by then" in text
+
+
+async def test_from_opening_keeps_everything(monkeypatch):
+    monkeypatch.setenv("ROUTE_HOME", "Home 1 @40.54,-3.64")
+    rp, day, rows = world()
+    plan = await rp.build(day)
+    rp.set_start(plan, None, free=False)
+    assert len(plan.markets) == 3 and len(plan.fixed) == 1 and not plan.closed
+    text, kb = rp.time_text(plan)
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert labels[0] == "☀️ From opening" and "18:30" in labels

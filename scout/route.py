@@ -136,6 +136,13 @@ class Route:
 
 
 LegFn = Callable[[int | None, int | None, int], Leg]   # from loc, to loc, leaving at (minutes)
+FREE = -1   # origin: you make your own way to the first stop (e.g. straight from work) — no first drive
+
+
+def _first(origin: int | None, home: int | None) -> int | None:
+    if origin == FREE:
+        return None
+    return origin if origin is not None else home
 
 
 def _enter(stop: Stop, arrive: int) -> tuple[int, int] | None:
@@ -157,7 +164,7 @@ def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None
           prefs: list[str] | None = None, origin: int | None = None) -> Route | None:
     """Best order visiting every stop, or None when no order fits. You set off from `origin`
     (default: home) at `start` or later, and finish at home when there is one."""
-    first_loc = origin if origin is not None else home
+    first_loc = _first(origin, home)
     n = len(stops)
     if n == 0:
         return Route([], 0, start)
@@ -309,7 +316,7 @@ def _without_clashing_slots(fixed: list[Stop], markets: list[Stop], leg: LegFn, 
                             lunch: bool) -> tuple[list[Route], str]:
     """Booked slots that clash: plans that give up as few of them as possible."""
     reasons = clashes(fixed, leg)
-    first_loc = origin if origin is not None else home
+    first_loc = _first(origin, home)
     if first_loc is not None and start > 0:
         f = min(fixed, key=lambda x: x.start)
         lg = leg(first_loc, f.loc, start)
@@ -380,9 +387,14 @@ class DayPlan:
     origin_title: str | None = None
     prefix: list[dict] = field(default_factory=list)   # re-plan: the part of the day already done
     lunch_left: bool = True
+    free_start: bool = False           # straight to the first stop (after work), no drive from home
+    begin_at: int | None = None        # chosen start time (None = from opening)
+    closed: list[str] = field(default_factory=list)    # closed by the time you start
+    all_fixed: list[Stop] = field(default_factory=list)
+    all_markets: list[Stop] = field(default_factory=list)
 
     def leg(self, a: int | None, b: int | None, t: int) -> Leg:
-        if a is None or b is None or a == b:
+        if a is None or b is None or a == b or a < 0 or b < 0:
             return Leg(0, 0.0, "same")
         minutes, km, source = self.raw[(a, b)]
         if source == "same":
@@ -541,9 +553,27 @@ class RoutePlanner:
 
     def compute(self, plan: DayPlan) -> DayPlan:
         prefs = self.prefs.get(plan.day.isoformat(), [])
+        origin = FREE if plan.free_start and plan.origin is None else plan.origin
         plan.best, plan.options, plan.problem = plan_options(plan.fixed, plan.markets, plan.leg, plan.start,
-                                                             plan.home, prefs, plan.origin, plan.lunch_left)
+                                                             plan.home, prefs, origin, plan.lunch_left)
         return plan
+
+    def set_start(self, plan: DayPlan, begin_at: int | None, free: bool | None = None) -> None:
+        """Start the day at `begin_at` (None = from opening); leave out what's over by then."""
+        if not plan.all_fixed and not plan.all_markets:
+            plan.all_fixed, plan.all_markets = list(plan.fixed), list(plan.markets)
+        plan.begin_at = begin_at
+        today = plan.day == self._today()
+        plan.start = max(begin_at or 0, self._now_min() if today else 0)
+        if free is not None:
+            plan.free_start = free
+        plan.lunch_left = plan.start <= LUNCH[0][1]   # starting after lunchtime: no lunch break
+        t = plan.start
+        plan.fixed = [f for f in plan.all_fixed if f.arrive_by >= t]
+        plan.markets = [m for m in plan.all_markets if any(hi >= max(lo, t) + m.stay for lo, hi in m.windows)]
+        plan.closed = ([f"{f.title} (booked {hm(f.start)})" for f in plan.all_fixed if f not in plan.fixed]
+                       + [f"{m.title} (closes {hm(max(hi for _, hi in m.windows))})"
+                          for m in plan.all_markets if m not in plan.markets])
 
     # ------------------------------------------------------------ messages
     @staticmethod
@@ -554,7 +584,7 @@ class RoutePlanner:
     def _maps_link(self, plan: DayPlan, route: Route) -> str | None:
         locs = [v.stop.loc for v in route.visits if v.stop.loc is not None]
         locs = [x for i, x in enumerate(locs) if i == 0 or locs[i - 1] != x]
-        start = plan.origin if plan.origin is not None else plan.home
+        start = plan.origin if plan.origin is not None else (None if plan.free_start else plan.home)
         if start is not None:
             locs = [start] + locs
         if plan.home is not None:
@@ -573,6 +603,8 @@ class RoutePlanner:
         lines = [f"🗺 <b>{escape(title or 'Your route')} — {day}</b>"]
         if plan.origin_title:
             lines.append(f"From {escape(plan.origin_title)}, leaving <b>{hm(plan.start)}</b>")
+        elif plan.free_start and route.visits:
+            lines.append(f"Starting at <b>{hm(route.visits[0].arrive)}</b>, straight to the first stop")
         elif route.home_leave is not None:
             lines.append(f"🏠 Leave home at <b>{hm(route.home_leave)}</b>")
         prev_leave = plan.start if plan.origin_title else None
@@ -612,6 +644,8 @@ class RoutePlanner:
                      + ("" if route.lunch or not plan.lunch_left else " · no lunch break in this plan"))
         if route.dropped:
             lines.append("Left out: " + ", ".join(escape(s.title) for s in route.dropped))
+        if plan.closed and not plan.origin_title:
+            lines.append("Closed by then: " + ", ".join(escape(t) for t in plan.closed))
         if plan.removed and not plan.origin_title:
             lines.append("Not counted (deleted from your calendar): " + ", ".join(escape(t) for t in plan.removed))
         link = self._maps_link(plan, route)
@@ -631,6 +665,8 @@ class RoutePlanner:
             order = " → ".join(escape(v.stop.title if v.stop.kind != "lunch" else "🍽") for v in r.visits)
             lines.append(f"\n<b>{chr(65 + i)}. {escape(r.label)}</b>\n   {order}\n   driving {r.drive}′, "
                          f"done {hm(r.end)}")
+        if plan.closed and not plan.origin_title:
+            lines.append("\nClosed by then: " + ", ".join(escape(t) for t in plan.closed))
         if plan.removed and not plan.origin_title:
             lines.append("\nNot counted (deleted from your calendar): " + ", ".join(escape(t) for t in plan.removed))
         return "\n".join(lines)
@@ -642,18 +678,54 @@ class RoutePlanner:
         if plan.fixed:
             lines.append("Booked (fixed): " + ", ".join(
                 f"{escape(s.title)} {hm(s.start)}" for s in sorted(plan.fixed, key=lambda s: s.start)))
-        lines.append(f"To fit in: {len(plan.markets)} markets.")
+        when = "from opening" if plan.begin_at is None else f"at {hm(plan.start)}"
+        lines.append(f"Starting {when}. To fit in: {len(plan.markets)} markets.")
+        if plan.closed:
+            lines.append("Closed by then: " + ", ".join(escape(t) for t in plan.closed))
         if plan.removed:
             lines.append("Not counted (deleted from your calendar): " + ", ".join(escape(t) for t in plan.removed))
-        lines.append("\nAny you want to see first? Tap them in order, then <b>Plan route</b>.")
+        lines.append("\nWhere do you want to start? Tap it (and any others in order), then <b>Plan route</b>.")
         rows = []
         for s in plan.markets:
             n = prefs.index(s.key) + 1 if s.key in prefs else None
             rows.append([InlineKeyboardButton(f"{n}️⃣ {s.title}"[:60] if n else s.title[:60],
                                               callback_data=f"rt:p:{iso}:{s.key}")])
+        if plan.home is not None:
+            rows.append([InlineKeyboardButton(("✅ " if not plan.free_start else "") + "🏠 From home",
+                                              callback_data=f"rt:s:{iso}:home"),
+                         InlineKeyboardButton(("✅ " if plan.free_start else "") + "📍 Straight to 1st",
+                                              callback_data=f"rt:s:{iso}:free")])
         rows.append([InlineKeyboardButton("🚗 Plan route" if prefs else "🚗 No preference — plan it",
                                           callback_data=f"rt:go:{iso}")])
         return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+    def time_text(self, plan: DayPlan) -> tuple[str, InlineKeyboardMarkup]:
+        iso = plan.day.isoformat()
+        text = (f"🗺 <b>Route for {plan.day.strftime('%a %-d %b')}</b>\n"
+                f"{len(plan.all_fixed or plan.fixed)} booked, {len(plan.all_markets or plan.markets)} other markets."
+                f"\n\nWhen do you start? (any other time: <code>/route {plan.day.strftime('%-d/%-m')} 18:15</code>)")
+        times = [17 * 60, 17 * 60 + 30, 18 * 60, 18 * 60 + 30, 19 * 60, 19 * 60 + 30]
+        rows = [[InlineKeyboardButton("☀️ From opening", callback_data=f"rt:t:{iso}:open")]]
+        if plan.day == self._today():
+            rows[0].append(InlineKeyboardButton("Now", callback_data=f"rt:t:{iso}:{self._now_min()}"))
+            times = [t for t in times if t > self._now_min()]
+        rows += [[InlineKeyboardButton(hm(t), callback_data=f"rt:t:{iso}:{t}") for t in times[i:i + 3]]
+                 for i in range(0, len(times), 3)]
+        return text, InlineKeyboardMarkup(rows)
+
+    async def _after_start(self, plan: DayPlan, edit) -> None:  # noqa: ANN001
+        """Start chosen: ask where to start (2+ markets) or plan straight away."""
+        if not plan.fixed and not plan.markets:
+            text = f"🗺 Nothing left to visit by then on {plan.day.strftime('%a %-d %b')}."
+            if plan.closed:
+                text += "\nClosed by then: " + ", ".join(plan.closed)
+            await edit.edit_message_text(text)
+            return
+        if len(plan.markets) >= 2 or (plan.markets and plan.home is not None and plan.begin_at is not None):
+            text, kb = self.ask_text(plan)
+            await edit.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+        await self._send_plan(await asyncio.to_thread(self.compute, plan), edit=edit)
 
     async def _send_plan(self, plan: DayPlan, edit=None, title: str | None = None) -> None:  # noqa: ANN001
         iso = plan.day.isoformat()
@@ -819,10 +891,15 @@ class RoutePlanner:
                 self.db.set_setting(HOME_KEY, rest)
                 await msg.reply_html(f"🏠 Home set: <b>{escape(parse_home(rest)[0])}</b>.")
             return
+        begin_at = None
+        if args and _hm(args[-1]) and ":" in args[-1]:
+            t = _hm(args.pop())
+            begin_at = t.hour * 60 + t.minute
         if args:
             day = parse_day(" ".join(args), self._today())
             if day is None:
-                await msg.reply_text("Usage: /route [day] — e.g. /route saturday, /route 21/11, /route tomorrow")
+                await msg.reply_text("Usage: /route [day] [HH:MM] — e.g. /route saturday, /route 21/11, "
+                                     "/route tomorrow 18:30")
                 return
         else:
             day = self.default_day()
@@ -838,12 +915,13 @@ class RoutePlanner:
             return
         self.plans[day.isoformat()] = plan
         self.prefs.pop(day.isoformat(), None)
-        if len(plan.markets) >= 2:
-            text, kb = self.ask_text(plan)
-            await note.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        if begin_at is not None:
+            self.set_start(plan, begin_at, free=True)
+            await self._after_start(plan, note)
             return
-        await note.delete()
-        await self._send_plan(await asyncio.to_thread(self.compute, plan))
+        self.set_start(plan, None, free=False)
+        text, kb = self.time_text(plan)
+        await note.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
     async def on_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -855,6 +933,19 @@ class RoutePlanner:
         plan = self.plans.get(iso)
         if plan is None:
             await q.answer("That plan is old — send /route again.", show_alert=True)
+            return
+        if action == "t":
+            val = parts[3]
+            begin_at = None if val == "open" else int(val)
+            self.set_start(plan, begin_at, free=begin_at is not None)
+            await q.answer()
+            await self._after_start(plan, q)
+            return
+        if action == "s":
+            plan.free_start = parts[3] == "free"
+            await q.answer()
+            text, kb = self.ask_text(plan)
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             return
         if action == "p":
             key = parts[3]
@@ -901,14 +992,25 @@ class RoutePlanner:
             await self._send_plan(plan, title="Updated route")
 
     async def task_text(self, args: list[str]) -> str:
-        """`python -m scout.cron route [day]`: the plan as plain text (no preference, not activated)."""
+        """`python -m scout.cron route [day] [HH:MM] [first-event-id]`: the plan as plain text (not activated).
+        With a time you go straight to the first stop (after work)."""
+        args = list(args)
+        first = args.pop() if len(args) >= 2 and args[-1].isdigit() and len(args[-1]) < 6 else None
+        begin_at = None
+        if args and ":" in args[-1] and _hm(args[-1]):
+            t = _hm(args.pop())
+            begin_at = t.hour * 60 + t.minute
         day = parse_day(" ".join(args), self._today()) if args else self.default_day()
         if day is None:
-            return "usage: route [day]"
+            return "usage: route [day] [HH:MM] [first-event-id]"
         plan = await self.build(day)
         if not plan.fixed and not plan.markets:
             return f"no markets on {day}"
+        self.set_start(plan, begin_at, free=begin_at is not None)
+        if first:
+            self.prefs[day.isoformat()] = [f"ev{first}"]
         await asyncio.to_thread(self.compute, plan)
+        self.prefs.pop(day.isoformat(), None)
         if plan.best is not None:
             html = self.route_text(plan, plan.best)
         elif plan.options:
