@@ -43,6 +43,7 @@ from urllib.parse import quote
 
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, filters
 
 from .db import Database, Event, utcnow
@@ -363,10 +364,14 @@ def _minutes(dt: datetime, tz) -> int:  # noqa: ANN001
 
 async def _edit(target, text: str, **kw) -> None:  # noqa: ANN001
     """Edit the bot's message: `target` is a button tap (CallbackQuery) or the message itself."""
-    if hasattr(target, "edit_message_text"):
-        await target.edit_message_text(text, **kw)
-    else:
-        await target.edit_text(text, **kw)
+    try:
+        if hasattr(target, "edit_message_text"):
+            await target.edit_message_text(text, **kw)
+        else:
+            await target.edit_text(text, **kw)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():   # tapping what's already selected: nothing to change
+            raise
 
 
 def parse_home(text: str) -> tuple[str, Point | None]:
@@ -960,13 +965,13 @@ class RoutePlanner:
             plan.lunch_left = not plan.lunch_left
             await q.answer("Lunch break on" if plan.lunch_left else "No lunch break")
             text, kb = self.ask_text(plan)
-            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            await _edit(q, text, parse_mode="HTML", reply_markup=kb)
             return
         if action == "s":
             plan.free_start = parts[3] == "free"
             await q.answer()
             text, kb = self.ask_text(plan)
-            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            await _edit(q, text, parse_mode="HTML", reply_markup=kb)
             return
         if action == "p":
             key = parts[3]
@@ -974,7 +979,7 @@ class RoutePlanner:
             prefs.remove(key) if key in prefs else prefs.append(key)
             await q.answer()
             text, kb = self.ask_text(plan)
-            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            await _edit(q, text, parse_mode="HTML", reply_markup=kb)
         elif action == "go":
             await q.answer("Planning…")
             await self._send_plan(await asyncio.to_thread(self.compute, plan), edit=q)

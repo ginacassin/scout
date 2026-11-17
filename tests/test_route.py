@@ -420,3 +420,14 @@ async def test_day_ends_at_the_last_market(monkeypatch):
     assert "Done at" in text and "home · back" not in text
     rp.activate(plan, r)
     assert rp.active(day.isoformat())["visits"][-1]["next"] is None   # no "leave" alert after the last stop
+
+
+
+async def test_tapping_the_selected_button_is_harmless():
+    from telegram.error import BadRequest
+    from scout.route import _edit
+
+    class Q:
+        async def edit_message_text(self, text, **kw):
+            raise BadRequest("Message is not modified: specified new message content and reply markup are exactly the same")
+    await _edit(Q(), "same")   # no exception
