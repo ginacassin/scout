@@ -333,7 +333,7 @@ async def test_after_work_start_straight_to_chosen_first_market(monkeypatch):
     r = plan.best or plan.options[0]
     assert r.visits[0].stop.title == "Skipped one"
     assert r.visits[0].begin == H("17:00") and r.home_leave is None    # no drive from home at the start
-    assert r.home_back is not None                                       # still ends at home
+    assert r.home_back is None                                           # the day ends at the last market
     text = rp.route_text(plan, r)
     assert "Starting at <b>17:00</b>, straight to the first stop" in text and "Closed by then" in text
 
@@ -407,3 +407,16 @@ async def test_no_lunch_when_starting_at_lunchtime_unless_asked(monkeypatch):
     assert plan.lunch_left is True
     text, kb = rp.ask_text(plan)
     assert any("Lunch break" in b.text for row in kb.inline_keyboard for b in row)
+
+
+
+async def test_day_ends_at_the_last_market(monkeypatch):
+    monkeypatch.setenv("ROUTE_HOME", "Home 1 @40.54,-3.64")
+    rp, day, rows = world()
+    plan = rp.compute(await rp.build(day))
+    r = plan.best
+    assert r.home_leave is not None and r.home_back is None
+    text = rp.route_text(plan, r)
+    assert "Done at" in text and "home · back" not in text
+    rp.activate(plan, r)
+    assert rp.active(day.isoformat())["visits"][-1]["next"] is None   # no "leave" alert after the last stop

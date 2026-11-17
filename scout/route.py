@@ -10,7 +10,7 @@ What goes in, for the chosen day:
 * Lunch: an hour starting between 13:30 and 14:30, wherever you are at that point.
 * Driving: OpenStreetMap routes × a Madrid traffic profile for the hour and weekday you leave
   (rush hours ×1.65–1.7, daytime ×1.25, Saturday shopping hours ×1.35, quiet ×1.1) + PARKING_MINUTES (5).
-* Home: the day starts and ends there. ROUTE_HOME ("address @lat,lon" or an address) in the environment;
+* Home: the day starts there (not after work) and ends at the last market — you go on elsewhere. ROUTE_HOME ("address @lat,lon" or an address) in the environment;
   /route home <address> overrides it.
 * Your preference: markets you tap first are visited first, in the order tapped.
 
@@ -162,7 +162,7 @@ def _enter(stop: Stop, arrive: int) -> tuple[int, int] | None:
 
 
 def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None,
-          prefs: list[str] | None = None, origin: int | None = None) -> Route | None:
+          prefs: list[str] | None = None, origin: int | None = None, back_home: bool = True) -> Route | None:
     """Best order visiting every stop, or None when no order fits. You set off from `origin`
     (default: home) at `start` or later, and finish at home when there is one."""
     first_loc = _first(origin, home)
@@ -223,7 +223,7 @@ def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None
     for state in by_size[n]:
         mask, _last, loc = state
         for li, lab in enumerate(labels[state]):
-            back = leg(loc, home, lab[0]) if home is not None else None
+            back = leg(loc, home, lab[0]) if home is not None and back_home else None
             score = (lab[1] + (back.minutes if back else 0), lab[0])
             if best is None or score < best[0]:
                 best = (score, state, li, back)
@@ -242,7 +242,7 @@ def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None
         visits.pop()
         route.finish = visits[-1].leave if visits else start
         route.lunch = False
-        if home is not None and visits:
+        if home is not None and back_home and visits:
             route.home_back = leg(visits[-1].stop.loc, home, route.finish)
     if origin is None and home is not None and visits and visits[0].drive:
         v0 = visits[0]
@@ -255,7 +255,7 @@ def solve(stops: list[Stop], leg: LegFn, start: int = 0, home: int | None = None
 
 def plan_options(fixed: list[Stop], markets: list[Stop], leg: LegFn, start: int = 0, home: int | None = None,
                  prefs: list[str] | None = None, origin: int | None = None,
-                 lunch: bool = True) -> tuple[Route | None, list[Route], str | None]:
+                 lunch: bool = True, back_home: bool = True) -> tuple[Route | None, list[Route], str | None]:
     """(the route, or None; options when not everything fits; a problem to explain)."""
     def lunch_stop(spec) -> list[Stop]:  # noqa: ANN001
         if not lunch:
@@ -264,10 +264,10 @@ def plan_options(fixed: list[Stop], markets: list[Stop], leg: LegFn, start: int 
         return [Stop("lunch", "Lunch", "lunch", None, [(lo, hi)], stay)]
 
     def run(stops: list[Stop]) -> Route | None:
-        return solve(stops, leg, start, home, prefs, origin)
+        return solve(stops, leg, start, home, prefs, origin, back_home)
 
     if fixed and run(fixed) is None:
-        return None, *_without_clashing_slots(fixed, markets, leg, start, home, prefs, origin, lunch)
+        return None, *_without_clashing_slots(fixed, markets, leg, start, home, prefs, origin, lunch, back_home)
     full = run(fixed + markets + lunch_stop(LUNCH))
     if full is not None:
         return full, [], None
@@ -314,7 +314,7 @@ def clashes(fixed: list[Stop], leg: LegFn) -> list[str]:
 
 def _without_clashing_slots(fixed: list[Stop], markets: list[Stop], leg: LegFn, start: int, home: int | None,
                             prefs: list[str] | None, origin: int | None,
-                            lunch: bool) -> tuple[list[Route], str]:
+                            lunch: bool, back_home: bool = True) -> tuple[list[Route], str]:
     """Booked slots that clash: plans that give up as few of them as possible."""
     reasons = clashes(fixed, leg)
     first_loc = _first(origin, home)
@@ -333,10 +333,10 @@ def _without_clashing_slots(fixed: list[Stop], markets: list[Stop], leg: LegFn, 
     for k in range(1, len(fixed) + 1):
         for combo in itertools.combinations(range(len(fixed)), k):
             keep = [f for i, f in enumerate(fixed) if i not in combo]
-            if solve(keep, leg, start, home, None, origin) is None:
+            if solve(keep, leg, start, home, None, origin, back_home) is None:
                 continue
             gone = [fixed[i] for i in combo]
-            best, options, _ = plan_options(keep, markets, leg, start, home, prefs, origin, lunch)
+            best, options, _ = plan_options(keep, markets, leg, start, home, prefs, origin, lunch, back_home)
             r = best or (options[0] if options else None)
             if r is None:
                 continue
@@ -397,6 +397,7 @@ class DayPlan:
     prefix: list[dict] = field(default_factory=list)   # re-plan: the part of the day already done
     lunch_left: bool = True
     free_start: bool = False           # straight to the first stop (after work), no drive from home
+    back_home: bool = False            # the day ends at the last market (you go on elsewhere)
     begin_at: int | None = None        # chosen start time (None = from opening)
     closed: list[str] = field(default_factory=list)    # closed by the time you start
     all_fixed: list[Stop] = field(default_factory=list)
@@ -564,7 +565,8 @@ class RoutePlanner:
         prefs = self.prefs.get(plan.day.isoformat(), [])
         origin = FREE if plan.free_start and plan.origin is None else plan.origin
         plan.best, plan.options, plan.problem = plan_options(plan.fixed, plan.markets, plan.leg, plan.start,
-                                                             plan.home, prefs, origin, plan.lunch_left)
+                                                             plan.home, prefs, origin, plan.lunch_left,
+                                                             plan.back_home)
         return plan
 
     def set_start(self, plan: DayPlan, begin_at: int | None, free: bool | None = None) -> None:
@@ -596,7 +598,7 @@ class RoutePlanner:
         start = plan.origin if plan.origin is not None else (None if plan.free_start else plan.home)
         if start is not None:
             locs = [start] + locs
-        if plan.home is not None:
+        if plan.home is not None and plan.back_home:
             locs = locs + [plan.home]
         if len(locs) < 2:
             return None
@@ -648,6 +650,8 @@ class RoutePlanner:
             prev_leave = v.leave
         if route.home_back:
             lines.append(f"   🚗 {route.home_back.minutes}′ home · back at <b>{hm(route.end)}</b>")
+        elif route.visits:
+            lines.append(f"🏁 Done at <b>{hm(route.finish)}</b>")
         lines.append("")
         lines.append(f"Driving {route.drive}′ in total (with traffic for the time of day, incl. parking)"
                      + ("" if route.lunch or not plan.lunch_left else " · no lunch break in this plan"))
@@ -770,7 +774,7 @@ class RoutePlanner:
                 here["next"] = v0.stop.title if v0.stop.kind != "lunch" else "lunch"
                 here["next_drive"] = v0.drive.minutes if v0.drive else 0
                 here["next_dest"] = self._where(plan, v0.stop.loc) if v0.stop.loc is not None else None
-            elif plan.home is not None:
+            elif plan.home is not None and plan.back_home:
                 here["next"], here["next_dest"] = "home", self._where(plan, plan.home)
                 here["next_drive"] = route.home_back.minutes if route.home_back else 0
             else:
@@ -784,7 +788,7 @@ class RoutePlanner:
                 nxt_title = nxt.stop.title if nxt.stop.kind != "lunch" else "lunch"
                 nxt_drive = nxt.drive.minutes if nxt.drive else 0
                 nxt_dest = self._where(plan, nxt.stop.loc) if nxt.stop.loc is not None else None
-            elif plan.home is not None:
+            elif plan.home is not None and plan.back_home:
                 nxt_title, nxt_drive = "home", (route.home_back.minutes if route.home_back else 0)
                 nxt_dest = self._where(plan, plan.home)
             else:
