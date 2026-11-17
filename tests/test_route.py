@@ -99,10 +99,15 @@ def test_too_much_for_one_day_offers_options():
     assert any(o.dropped for o in options)
 
 
-def test_clashing_bookings_are_reported():
-    leg = matrix_leg({(0, 1): 45})
-    _, options, problem = plan_options([fixed(0, "A", "10:00"), fixed(1, "B", "10:45")], [], leg)
-    assert options == [] and "clash" in problem
+def test_clashing_bookings_are_named_and_each_alternative_drops_one():
+    leg = matrix_leg({(0, 1): 40, (0, 2): 10, (1, 2): 35, (0, 3): 15, (1, 3): 30, (2, 3): 10})
+    fixed_stops = [fixed(0, "Batres", "11:00"), fixed(1, "Tres Olivos", "11:00"), fixed(2, "NOK", "12:20")]
+    best, options, problem = plan_options(fixed_stops, [market(3, "Flat", "10:00", "19:00")], leg)
+    assert best is None and "Batres 11:00 and Tres Olivos 11:00" in problem
+    assert len(options) == 2
+    assert all(len([d for d in o.dropped if d.kind == "fixed"]) == 1 for o in options)
+    assert {o.dropped[0].title for o in options} == {"Batres", "Tres Olivos"}
+    assert all("NOK" in order(o) and "Flat" in order(o) for o in options)
 
 
 def test_home_start_and_return():

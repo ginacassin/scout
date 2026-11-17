@@ -198,7 +198,7 @@ def plan_options(fixed: list[Stop], markets: list[Stop], leg: LegFn, start: int 
         return Stop("lunch", "Lunch", "lunch", None, [(lo, hi)], stay)
 
     if fixed and solve(fixed, leg, start, home) is None:
-        return None, [], "Your booked slots clash with each other (not enough time to drive between them)."
+        return None, *_without_clashing_slots(fixed, markets, leg, start, home, prefs)
     full = solve(fixed + markets + [lunch(LUNCH)], leg, start, home, prefs)
     if full is not None:
         return full, [], None
@@ -228,6 +228,43 @@ def plan_options(fixed: list[Stop], markets: list[Stop], leg: LegFn, start: int 
             r.lunch = False
             options.append(r)
     return None, options[:MAX_OPTIONS], None if options else "Nothing fits that day, not even with a market left out."
+
+
+def clashes(fixed: list[Stop], leg: LegFn) -> list[str]:
+    """Booked slots you can't get between, in plain words."""
+    out = []
+    ordered = sorted(fixed, key=lambda s: s.start)
+    for a, b in zip(ordered, ordered[1:]):
+        need = a.leave + leg(a.loc, b.loc).minutes
+        if need > b.start:
+            out.append(f"{a.title} {hm(a.start)} and {b.title} {hm(b.start)}: you'd reach the second at "
+                       f"{hm(need)} ({leg(a.loc, b.loc).minutes}′ drive)")
+    return out
+
+
+def _without_clashing_slots(fixed: list[Stop], markets: list[Stop], leg: LegFn, start: int, home: int | None,
+                            prefs: list[str] | None) -> tuple[list[Route], str]:
+    """Booked slots that clash: plans that give up as few of them as possible."""
+    problem = "Your booked slots clash: " + "; ".join(clashes(fixed, leg) or ["not enough time between them"])
+    found: list[Route] = []
+    for k in range(1, len(fixed)):
+        for combo in itertools.combinations(range(len(fixed)), k):
+            keep = [f for i, f in enumerate(fixed) if i not in combo]
+            if solve(keep, leg, start, home) is None:
+                continue
+            gone = [fixed[i] for i in combo]
+            best, options, _ = plan_options(keep, markets, leg, start, home, prefs)
+            r = best or (options[0] if options else None)
+            if r is None:
+                continue
+            extra = f" · {r.label}" if r.label else ""
+            r.label = "Skip booked " + " and ".join(f"{g.title} {hm(g.start)}" for g in gone) + extra
+            r.dropped = gone + r.dropped
+            found.append(r)
+        if found:
+            break
+    found.sort(key=lambda r: (len(r.dropped), r.drive, r.end))
+    return found[:MAX_OPTIONS], problem
 
 
 # ============================================================================ the bot side
@@ -460,9 +497,12 @@ class RoutePlanner:
 
     def options_text(self, plan: DayPlan) -> str:
         day = plan.day.strftime("%a %-d %b")
-        lines = [f"🗺 <b>{day}: not everything fits</b>",
-                 f"{len(plan.markets) + len(plan.fixed)} markets with the opening times, your slots and an hour's "
-                 f"lunch around 14:00 can't all be done. Pick one:"]
+        lines = [f"🗺 <b>{day}: not everything fits</b>"]
+        if plan.problem:
+            lines.append(escape(plan.problem) + ". Pick one:")
+        else:
+            lines.append(f"{len(plan.markets) + len(plan.fixed)} markets with the opening times, your slots and an "
+                         f"hour's lunch around 14:00 can't all be done. Pick one:")
         for i, r in enumerate(plan.options):
             order = " → ".join(escape(v.stop.title if v.stop.kind != "lunch" else "🍽") for v in r.visits)
             lines.append(f"\n<b>{chr(65 + i)}. {escape(r.label)}</b>\n   {order}\n   driving {r.drive}′, "
