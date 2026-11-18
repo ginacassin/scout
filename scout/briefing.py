@@ -91,9 +91,25 @@ class Briefing:
         out.sort(key=lambda r: (stop_time(r[0], day, self.tz) or far, r[0].id))
         return out
 
+    async def calendar_markets(self, day: date) -> list[tuple[Event, str]]:
+        """markets_on, minus the ones whose entry for `day` you deleted in Google Calendar (not going)."""
+        markets = self.markets_on(day)
+        cal = self.app.bot_data.get("calendar")
+        if cal is None:
+            return markets
+        out = []
+        for ev, handle in markets:
+            try:
+                if ev.booked_start is None and await cal.removed_on(ev.id, day):
+                    continue
+            except Exception:  # noqa: BLE001 - a calendar hiccup shouldn't drop the briefing
+                log.warning("Calendar check for event %s failed", ev.id, exc_info=True)
+            out.append((ev, handle))
+        return out
+
     # ------------------------------------------------------------------- text
     async def text(self, day: date) -> tuple[str, InlineKeyboardMarkup | None] | None:
-        markets = self.markets_on(day)
+        markets = await self.calendar_markets(day)
         if not markets:
             return None
         planner = self.app.bot_data.get("planner")
@@ -177,10 +193,11 @@ class Briefing:
         except TelegramError:
             log.exception("Couldn't send the briefing for %s", day)
             return False
+        markets = await self.calendar_markets(day)
         if not force:
             self.db.set_setting(SENT_KEY, day.isoformat())
-            self._suppress_note_reminders(day, self.markets_on(day))
-        log.info("briefing sent day=%s markets=%d", day, len(self.markets_on(day)))
+            self._suppress_note_reminders(day, markets)
+        log.info("briefing sent day=%s markets=%d", day, len(markets))
         return True
 
     async def daily_job(self, ctx: ContextTypes.DEFAULT_TYPE | None = None) -> None:

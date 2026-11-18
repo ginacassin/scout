@@ -94,3 +94,17 @@ async def test_login_check_warns_once_until_fixed(tmp_path):
     ab.client.check_login = AsyncMock(return_value=(200, {"logged_in": False}))
     await b.login_check()
     assert app.bot.send_message.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_day_deleted_from_google_calendar_is_left_out(tmp_path):
+    b, app, db = setup(tmp_path)
+    with db.session() as s:
+        alma_id = next(e.id for e in s.query(Event).all() if e.title.startswith("Alma"))
+
+    class Cal:
+        async def removed_on(self, event_id, day):
+            return event_id == alma_id
+    app.bot_data["calendar"] = Cal()
+    text, _ = await b.text(FRI)
+    assert "1 market" in text and "Alma Market" not in text and "Clara del Rey" in text
